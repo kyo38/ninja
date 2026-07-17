@@ -1,33 +1,50 @@
 use anyhow::Result;
+use crate::core::path::PathHeader;
 
 pub const FLAG_SYN: u8 = 0x01;
 pub const FLAG_ACK: u8 = 0x02;
 pub const FLAG_DATA: u8 = 0x04;
+pub const FLAG_PATH: u8 = 0x08; // パス情報が含まれていることを示すフラグ
 
 #[derive(Debug, Clone)]
 pub struct NinjaPacket {
     pub version: u8,
     pub flags: u8,
     pub length: u16,
+    pub path: Option<PathHeader>, // パスヘッダのフィールドを追加
     pub payload: Vec<u8>,
 }
 
 impl NinjaPacket {
-    pub fn new(flags: u8, payload: Vec<u8>) -> Self {
+    pub fn new(flags: u8, path: Option<PathHeader>, payload: Vec<u8>) -> Self {
+        let mut final_flags = flags;
+        if path.is_some() {
+            final_flags |= FLAG_PATH;
+        }
+
         Self {
             version: 1,
-            flags,
-            length: payload.len() as u16,
+            flags: final_flags,
+            length: 0, // to_bytesの中で正確に計算されます
+            path,
             payload,
         }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(4 + self.payload.len());
+        let mut path_bytes = match &self.path {
+            Some(p) => p.to_bytes(),
+            None => Vec::new(),
+        };
+
+        let total_payload_len = path_bytes.len() + self.payload.len();
+        let mut buf = Vec::with_capacity(4 + total_payload_len);
 
         buf.push(self.version);
         buf.push(self.flags);
-        buf.extend_from_slice(&self.length.to_be_bytes());
+        buf.extend_from_slice(&(total_payload_len as u16).to_be_bytes());
+        
+        buf.append(&mut path_bytes);
         buf.extend_from_slice(&self.payload);
 
         buf
@@ -46,12 +63,22 @@ impl NinjaPacket {
             anyhow::bail!("invalid length");
         }
 
-        let payload = data[4..4 + length].to_vec();
+        let mut offset = 4;
+        let mut path = None;
+
+        if flags & FLAG_PATH != 0 {
+            let (parsed_path, read_size) = PathHeader::from_bytes(&data[offset..4+length])?;
+            path = Some(parsed_path);
+            offset += read_size;
+        }
+
+        let payload = data[offset..4 + length].to_vec();
 
         Ok(Self {
             version,
             flags,
             length: length as u16,
+            path,
             payload,
         })
     }
