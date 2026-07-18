@@ -5,12 +5,12 @@ pub mod core {
 use ninja::platform::udp::UdpTransport;
 use ninja::platform::abstraction::Transport;
 use ninja::core::packet::{NinjaPacket, FLAG_ACK};
-use core::graph::{Task, resolve_execution_order};
+// 【プロ仕様化 ④】Executor と LocalExecutor をインポート
+use core::graph::{Task, resolve_execution_order, Executor, LocalExecutor};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 
-// 【プロ仕様化 ①】タスクのライフサイクル状態を厳密に定義
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TaskStatus {
     Pending,
@@ -54,6 +54,9 @@ fn main() {
     let bind_addr = format!("127.0.0.1:{}", listen_port);
     let transport = UdpTransport::bind(&bind_addr);
 
+    // 【プロ仕様化 ④】使用するエグゼキュータをここでインスタンス化
+    let executor = LocalExecutor;
+
     loop {
         let (data, addr) = transport.recv();
 
@@ -93,7 +96,6 @@ fn main() {
                             Ok(received_tasks) => {
                                 println!("[AS {}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_as_id);
                                 
-                                // 【プロ仕様化 ①】明示的なタスク状態管理（State）の初期化
                                 let mut task_states: HashMap<String, TaskStatus> = received_tasks
                                     .iter()
                                     .map(|t| (t.name.clone(), TaskStatus::Pending))
@@ -105,14 +107,11 @@ fn main() {
                                     let mut progress = false;
                                     let mut ready_tasks = Vec::new();
 
-                                    // 実行可能なタスクのスキャン
                                     for task in &received_tasks {
-                                        // すでに完了、または失敗しているタスクはスキップ
                                         if task_states.get(&task.name) != Some(&TaskStatus::Pending) {
                                             continue;
                                         }
 
-                                        // すべての依存タスク（deps）が「Done」状態であるか検証
                                         let is_ready = task.deps.iter().all(|dep| {
                                             task_states.get(dep) == Some(&TaskStatus::Done)
                                         });
@@ -129,11 +128,8 @@ fn main() {
                                         }
 
                                         for task in ready_tasks {
-                                            println!("  ⚡ [Execute] ➔ [{}] Running: {}", task.name, task.command);
-                                            
-                                            // ここで実際のコマンド実行処理のダミー（現状は必ず成功扱い）
-                                            // 将来的に成否を判断して Failed に落とす差し込み口になります
-                                            let success = true; 
+                                            // 【プロ仕様化 ④】ハードコードされていた実行部を分離したExecutorへ委譲
+                                            let success = executor.execute(&task);
 
                                             if success {
                                                 task_states.insert(task.name.clone(), TaskStatus::Done);
@@ -145,13 +141,11 @@ fn main() {
                                         }
                                     }
 
-                                    // これ以上進捗がない場合はループを抜ける
                                     if !progress {
                                         break;
                                     }
                                 }
 
-                                // 【プロ仕様化 ②】ループ停止後の判定とデッドロック（循環依存）の検出
                                 let mut pending_tasks = Vec::new();
                                 let mut failed_tasks = Vec::new();
 
@@ -168,7 +162,6 @@ fn main() {
                                 } else if !failed_tasks.is_empty() {
                                     println!("❌ [Ninja Engine] タスクの実行に失敗したため、後続処理を中断しました。失敗タスク: {:?}", failed_tasks);
                                 } else {
-                                    // 進捗が止まったのにPendingが残っている ＝ 循環参照がある、もしくは未定義のタスクに依存している
                                     println!("🛑 [Ninja Engine] 致命的エラー: デッドロック（循環依存または未定義の依存関係）を検出しました。");
                                     println!("  └── 実行不可能なタスク群: {:?}", pending_tasks);
                                     println!();

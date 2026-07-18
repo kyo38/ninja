@@ -1,8 +1,7 @@
 // src/core/graph.rs
 use std::collections::{HashMap, HashSet};
-use serde::{Serialize, Deserialize}; // シリアライズ用のトレイトをインポート
+use serde::{Serialize, Deserialize};
 
-// クライアントとルーター間でパケットに載せて送受信できるよう、マクロを付与
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
@@ -52,4 +51,24 @@ pub fn resolve_execution_order(tasks: &[Task]) -> Result<Vec<Task>, String> {
     }
 
     Ok(order)
+}
+
+// =================================================================
+// 【プロ仕様化 ④】Executor（実行環境）の分離・抽象化
+// =================================================================
+
+pub trait Executor {
+    /// タスクを受け取り、その実行成否を返す
+    fn execute(&self, task: &Task) -> bool;
+}
+
+/// ローカル環境で実行を担当する構造体（現在はログ出力のみ）
+pub struct LocalExecutor;
+
+impl Executor for LocalExecutor {
+    fn execute(&self, task: &Task) -> bool {
+        println!("  ⚡ [LocalExecute] ➔ [{}] Running: {}", task.name, task.command);
+        // 現状は常に成功扱い。将来的に std::process::Command の実行結果などに差し替える
+        true 
+    }
 }
