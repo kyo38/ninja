@@ -5,15 +5,18 @@ pub mod core {
 use ninja::platform::udp::UdpTransport;
 use ninja::platform::abstraction::Transport;
 use ninja::core::packet::{NinjaPacket, FLAG_ACK};
-// 【プロ仕様化 ④】Executor と LocalExecutor をインポート
 use core::graph::{Task, resolve_execution_order, Executor, LocalExecutor};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::thread;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TaskStatus {
     Pending,
+    Running,
     Done,
     Failed,
 }
@@ -53,9 +56,8 @@ fn main() {
 
     let bind_addr = format!("127.0.0.1:{}", listen_port);
     let transport = UdpTransport::bind(&bind_addr);
-
-    // 【プロ仕様化 ④】使用するエグゼキュータをここでインスタンス化
-    let executor = LocalExecutor;
+    
+    let executor = Arc::new(LocalExecutor);
 
     loop {
         let (data, addr) = transport.recv();
@@ -94,77 +96,123 @@ fn main() {
                         
                         match serde_json::from_slice::<Vec<Task>>(&packet.payload) {
                             Ok(received_tasks) => {
-                                println!("[AS {}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_as_id);
+                                // 修正点 ①: 明示的な名前付き引数に変更
+                                println!("[AS {my_id}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_id = my_as_id);
                                 
-                                let mut task_states: HashMap<String, TaskStatus> = received_tasks
+                                // =========================================================
+                                // 🛠️ 1. イニシャルリセット（状態の初期化）
+                                // =========================================================
+                                let raw_states: HashMap<String, TaskStatus> = received_tasks
                                     .iter()
                                     .map(|t| (t.name.clone(), TaskStatus::Pending))
                                     .collect();
+                                let task_states = Arc::new(Mutex::new(raw_states));
+                                let (tx, rx) = mpsc::channel::<(String, bool)>();
 
                                 println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
 
+                                // =========================================================
+                                // 🔄 2. メメインループ（イベント駆動型DAG実行）
+                                // =========================================================
+                                let mut is_deadlocked = false;
+
                                 loop {
-                                    let mut progress = false;
                                     let mut ready_tasks = Vec::new();
+                                    let mut has_running = false;
+                                    let mut has_pending = false;
 
-                                    for task in &received_tasks {
-                                        if task_states.get(&task.name) != Some(&TaskStatus::Pending) {
-                                            continue;
-                                        }
-
-                                        let is_ready = task.deps.iter().all(|dep| {
-                                            task_states.get(dep) == Some(&TaskStatus::Done)
-                                        });
-
-                                        if is_ready {
-                                            ready_tasks.push(task.clone());
+                                    {
+                                        let states = task_states.lock().unwrap();
+                                        for task in &received_tasks {
+                                            match states.get(&task.name) {
+                                                Some(&TaskStatus::Pending) => {
+                                                    has_pending = true;
+                                                    let is_ready = task.deps.iter().all(|dep| {
+                                                        states.get(dep) == Some(&TaskStatus::Done)
+                                                    });
+                                                    if is_ready {
+                                                        ready_tasks.push(task.clone());
+                                                    }
+                                                }
+                                                Some(&TaskStatus::Running) => {
+                                                    has_running = true;
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
 
                                     if !ready_tasks.is_empty() {
                                         if ready_tasks.len() > 1 {
                                             let names: Vec<String> = ready_tasks.iter().map(|t| t.name.clone()).collect();
-                                            println!("  [⚡ Parallel Ready] 同時実行可能なタスク群を検知: {:?}", names);
+                                            println!("  [⚡ Parallel Ready] 同時並列実行を開始します: {:?}", names);
                                         }
 
                                         for task in ready_tasks {
-                                            // 【プロ仕様化 ④】ハードコードされていた実行部を分離したExecutorへ委譲
-                                            let success = executor.execute(&task);
-
-                                            if success {
-                                                task_states.insert(task.name.clone(), TaskStatus::Done);
-                                            } else {
-                                                task_states.insert(task.name.clone(), TaskStatus::Failed);
-                                                println!("  ❌ [Execute] ➔ [{}] Failed", task.name);
+                                            {
+                                                let mut states = task_states.lock().unwrap();
+                                                states.insert(task.name.clone(), TaskStatus::Running);
                                             }
-                                            progress = true;
+
+                                            let tx_clone = tx.clone();
+                                            let exec_clone = Arc::clone(&executor);
+
+                                            thread::spawn(move || {
+                                                let success = exec_clone.execute(&task);
+                                                let _ = tx_clone.send((task.name, success));
+                                            });
+                                        }
+                                        continue;
+                                    }
+
+                                    if has_running {
+                                        if let Ok((finished_task, success)) = rx.recv() {
+                                            let mut states = task_states.lock().unwrap();
+                                            if success {
+                                                states.insert(finished_task, TaskStatus::Done);
+                                            } else {
+                                                states.insert(finished_task, TaskStatus::Failed);
+                                            }
+                                            continue;
                                         }
                                     }
 
-                                    if !progress {
+                                    // 修正点 ②: フラグの評価を厳密に行いデッドロックを検知
+                                    if has_pending && !has_running {
+                                        is_deadlocked = true;
+                                        break;
+                                    }
+
+                                    if !has_running {
                                         break;
                                     }
                                 }
 
+                                // =========================================================
+                                // 🏁 3. 終了処理（結果判定とエラーハンドリング）
+                                // =========================================================
                                 let mut pending_tasks = Vec::new();
                                 let mut failed_tasks = Vec::new();
 
-                                for (name, status) in &task_states {
-                                    match status {
-                                        TaskStatus::Pending => pending_tasks.push(name.clone()),
-                                        TaskStatus::Failed => failed_tasks.push(name.clone()),
-                                        TaskStatus::Done => {}
+                                {
+                                    let states = task_states.lock().unwrap();
+                                    for (name, status) in states.iter() {
+                                        match status {
+                                            TaskStatus::Pending | TaskStatus::Running => pending_tasks.push(name.clone()),
+                                            TaskStatus::Failed => failed_tasks.push(name.clone()),
+                                            TaskStatus::Done => {}
+                                        }
                                     }
                                 }
 
-                                if pending_tasks.is_empty() && failed_tasks.is_empty() {
-                                    println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
-                                } else if !failed_tasks.is_empty() {
-                                    println!("❌ [Ninja Engine] タスクの実行に失敗したため、後続処理を中断しました。失敗タスク: {:?}", failed_tasks);
-                                } else {
+                                if is_deadlocked {
                                     println!("🛑 [Ninja Engine] 致命的エラー: デッドロック（循環依存または未定義の依存関係）を検出しました。");
                                     println!("  └── 実行不可能なタスク群: {:?}", pending_tasks);
                                     println!();
+                                } else if !failed_tasks.is_empty() {
+                                    println!("❌ [Ninja Engine] タスクの実行に失敗したため、後続処理を中断しました。失敗タスク: {:?}", failed_tasks);
+                                } else {
+                                    println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
                                 }
                             }
                             Err(json_err) => {
