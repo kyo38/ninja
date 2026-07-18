@@ -1,7 +1,9 @@
 // src/core/graph.rs
 use std::collections::{HashMap, HashSet};
+use serde::{Serialize, Deserialize}; // シリアライズ用のトレイトをインポート
 
-#[derive(Clone, Debug)]
+// クライアントとルーター間でパケットに載せて送受信できるよう、マクロを付与
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
     pub deps: Vec<String>,
@@ -10,7 +12,6 @@ pub struct Task {
 
 /// 依存関係を解析して、安全な実行順（パス）に並べる
 pub fn resolve_execution_order(tasks: &[Task]) -> Result<Vec<Task>, String> {
-    // 警告対応: mut を削除
     let task_map: HashMap<String, Task> = tasks.iter().map(|t| (t.name.clone(), t.clone())).collect();
     let mut visited = HashSet::new();
     let mut temp_visited = HashSet::new();

@@ -1,128 +1,131 @@
-use ninja::core::packet::{NinjaPacket, FLAG_SYN};
+// src/bin/client.rs
+use ninja::core::packet::{NinjaPacket, FLAG_SYN, FLAG_DATA};
 use ninja::core::path::{PathHeader, HopField};
-use rand::seq::SliceRandom;
 use std::env;
-use std::net::UdpSocket;
-use std::thread;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-#[derive(Clone)]
-struct ClientHop {
-    as_id: u32,
-    egress_if: u16,
-}
-
-struct PathGenerator {
-    hops: Vec<ClientHop>,
-}
+// グラフモジュールのTask構造体を再利用
+#[path = "../core/graph.rs"]
+pub mod graph;
+use graph::Task;
 
 fn main() {
-    // コマンドライン引数をパース（デフォルト値: AS 200, ポート 5000）
+    // 期待する引数形式: cargo run --bin client -- [自分のポート] [宛先IP:PORT] [ASパス...]
+    // 例: cargo run --bin client -- 9000 127.0.0.1:4000 100 2 200 0
     let args: Vec<String> = env::args().collect();
-    let target_as: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200);
-    let target_port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5000);
 
-    println!("=============================================");
-    println!("  Client started with Multi-hop Path-Switching!");
-    println!("  Targeting Entry Node: AS {} @ 127.0.0.1:{}", target_as, target_port);
-    println!("=============================================");
+    if args.len() < 4 {
+        println!("Usage: cargo run --bin client -- [my_port] [dest_ip:port] [as_id egress_if ...]");
+        println!("Example: cargo run --bin client -- 9000 127.0.0.1:4000 100 2 200 0");
+        return;
+    }
 
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("Failed to bind socket");
-    socket.set_read_timeout(Some(Duration::from_secs(2))).expect("Failed to set timeout");
+    let my_port = args[1].parse::<u16>().expect("Invalid client port");
+    let dest_addr: SocketAddr = args[2].parse().expect("Invalid destination address");
 
-    let mut rng = rand::thread_rng();
+    // 残りの引数から動的にホップフィールドを組み立てる
+    let path_args = &args[3..];
+    if path_args.len() % 2 != 0 {
+        println!("Error: Path arguments must be pairs of (AS_ID, EGRESS_IF)");
+        return;
+    }
 
-    for i in 1..=5 {
-        println!("\n--- [Test Round {}] ---", i);
-
-        // クロージャを使わず、ループの中で毎回動的なパスの選択肢を配列として生成します
-        let mut paths = vec![
-            // パスA: AS target_as(IF 2) -> 次のAS(IF 0)
-            PathGenerator {
-                hops: vec![
-                    ClientHop { as_id: target_as, egress_if: 2 },
-                    ClientHop { as_id: target_as + 100, egress_if: 0 },
-                ],
-            },
-            // パスB: AS target_as(IF 3) -> 次のAS(IF 0)
-            PathGenerator {
-                hops: vec![
-                    ClientHop { as_id: target_as, egress_if: 3 },
-                    ClientHop { as_id: target_as + 200, egress_if: 0 },
-                ],
-            },
-            // パスC: AS target_as(IF 0: ローカル終了)
-            PathGenerator {
-                hops: vec![
-                    ClientHop { as_id: target_as, egress_if: 0 },
-                ],
-            },
-        ];
-
-        // 経路をランダムにシャッフルして選択
-        paths.shuffle(&mut rng);
-        let selected_path = &paths[0];
-
-        print!("-> Selected Path: ");
-        for (idx, hop) in selected_path.hops.iter().enumerate() {
-            if idx > 0 { print!(" -> "); }
-            print!("AS {}(IF {})", hop.as_id, hop.egress_if);
-        }
-        println!();
-
-        let my_port = socket.local_addr().unwrap().port();
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&my_port.to_be_bytes());
-        payload.extend_from_slice(b"hello SCION multipath");
-
-        let mut router_hops = Vec::new();
-        for hop in &selected_path.hops {
-            let hop_field = HopField {
-                as_id: hop.as_id,
-                egress_if: hop.egress_if,
-                mac: [0; 4],
-            };
-            router_hops.push(hop_field);
-        }
-
-        let path_header = PathHeader {
-            current_hop_index: 0,
-            hops: router_hops,
-        };
-
-        let packet = NinjaPacket::new(FLAG_SYN, Some(path_header), payload);
-        let bytes = packet.to_bytes();
-
-        // 指定されたポートへ動的に送信
-        let target_addr = format!("127.0.0.1:{}", target_port);
-        socket.send_to(&bytes, &target_addr).expect("Failed to send");
-        println!("Packet injected to Entry Node (AS {} @ {}).", target_as, target_addr);
-
-        let mut buf = [0u8; 1024];
-        println!("Waiting for response...");
+    let mut hops = Vec::new();
+    for i in (0..path_args.len()).step_by(2) {
+        let as_id = path_args[i].parse::<u32>().expect("Invalid AS ID in path");
+        let egress_if_val = path_args[i+1].parse::<u16>().expect("Invalid Egress IF in path");
         
-        let mut retry_count = 0;
-        loop {
-            match socket.recv_from(&mut buf) {
-                Ok((size, addr)) => {
-                    println!("🎉 Response received from {}: {:?}", addr, &buf[..size]);
-                    break;
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::ConnectionReset && retry_count < 2 {
-                        retry_count += 1;
-                        continue;
+        // エラー修正: mac のサイズを 4バイト に合わせる
+        hops.push(HopField { 
+            as_id, 
+            egress_if: egress_if_val,
+            mac: [0u8; 4], // 4バイトのダミーMACを設定
+        });
+    }
+
+    let path_header = PathHeader {
+        current_hop_index: 0,
+        hops,
+    };
+
+    println!("=============================================");
+    println!("  ninja client starting on port {}...", my_port);
+    println!("  Targeting Router: {}", dest_addr);
+    println!("  Configured Path: {:?}", path_header.hops);
+    println!("=============================================");
+
+    // クライアント自身の真のポートでUDPバインド（応答受け取り用）
+    let bind_addr = format!("127.0.0.1:{}", my_port);
+    let socket = UdpSocket::bind(&bind_addr).expect("Failed to bind local UDP socket");
+    socket.set_read_timeout(Some(Duration::from_secs(3))).expect("Failed to set timeout");
+
+    // 1. まずはコネクション確立（SYN）を送信
+    let mut syn_payload = Vec::new();
+    syn_payload.extend_from_slice(&my_port.to_be_bytes()); // 先頭2バイトに真のポートを隠す
+    syn_payload.extend_from_slice(b"Hello Control Plane");
+
+    let syn_packet = NinjaPacket::new(FLAG_SYN, Some(path_header.clone()), syn_payload);
+    
+    println!("[Client] Sending SYN packet to establish channel...");
+    socket.send_to(&syn_packet.to_bytes(), dest_addr).expect("Failed to send SYN");
+
+    // 応答待受
+    let mut buf = [0u8; 2048];
+    match socket.recv_from(&mut buf) {
+        Ok((size, from)) => {
+            if let Ok(ack_packet) = NinjaPacket::from_bytes(&buf[..size]) {
+                if ack_packet.is_ack() {
+                    println!("🎉 [Client] Handshake Success! Received response from {}: {}", from, String::from_utf8_lossy(&ack_packet.payload));
+                    
+                    // --------------------------------------------------------
+                    // 依存関係タスクグラフ（Graph）を送信する
+                    // --------------------------------------------------------
+                    println!("\n[Client] 依存関係タスク（Graph）を構築中...");
+                    let tasks = vec![
+                        Task {
+                            name: "deploy".to_string(),
+                            deps: vec!["build".to_string(), "test".to_string()],
+                            command: "echo 'Deploying to network...'".to_string(),
+                        },
+                        Task {
+                            name: "build".to_string(),
+                            deps: vec!["codegen".to_string()],
+                            command: "cargo build".to_string(),
+                        },
+                        Task {
+                            name: "test".to_string(),
+                            deps: vec!["codegen".to_string()],
+                            command: "cargo test".to_string(),
+                        },
+                        Task {
+                            name: "codegen".to_string(),
+                            deps: vec![],
+                            command: "echo 'Generating path matrices...'".to_string(),
+                        },
+                    ];
+
+                    // タスク配列をJSON文字列にシリアライズ
+                    match serde_json::to_vec(&tasks) {
+                        Ok(json_payload) => {
+                            println!("[Client] Sending Task Graph (DATA packet, size: {} bytes)...", json_payload.len());
+                            let mut fresh_path = path_header.clone();
+                            fresh_path.current_hop_index = 0;
+
+                            let data_packet = NinjaPacket::new(FLAG_DATA, Some(fresh_path), json_payload);
+                            socket.send_to(&data_packet.to_bytes(), dest_addr).expect("Failed to send DATA");
+                            println!("[Client] Task Graph sent successfully.");
+                        }
+                        Err(e) => {
+                            println!("[Client] Failed to serialize tasks: {}", e);
+                        }
                     }
-                    if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
-                        println!("[Info] Timeout - No response (Path might be broken or target node offline).");
-                    } else {
-                        println!("[Error] Communication error: {:?}", e);
-                    }
-                    break;
+                    // --------------------------------------------------------
                 }
             }
         }
-
-        thread::sleep(Duration::from_millis(800));
+        Err(e) => {
+            println!("[Client] Timeout or error waiting for ACK: {:?}", e);
+        }
     }
 }

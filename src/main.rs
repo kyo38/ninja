@@ -145,7 +145,39 @@ fn main() {
                             println!("🎉 [AS {}] Reached Final Destination! (Payload too short to extract port)", my_as_id);
                         }
                     } else if packet.is_data() {
-                        println!("🎉 [AS {}] Reached Final Destination! DATA: {}", my_as_id, String::from_utf8_lossy(&packet.payload));
+                        println!("🎉 [AS {}] Reached Final Destination! DATA packet received.", my_as_id);
+                        
+                        // 【新機能】受信したJSONペイロードをTask構造体の配列へデシリアライズ
+                        match serde_json::from_slice::<Vec<Task>>(&packet.payload) {
+                            Ok(received_tasks) => {
+                                println!("[AS {}] ✓ 伝送されたタスク定義のデシリアライズに成功（{}個のタスク）", my_as_id, received_tasks.len());
+                                
+                                // 動的な依存関係解決の実行
+                                match resolve_execution_order(&received_tasks) {
+                                    Ok(ordered_tasks) => {
+                                        print!("🚀 [AS {}] [Dynamic Execution Path]: ", my_as_id);
+                                        for (i, t) in ordered_tasks.iter().enumerate() {
+                                            if i > 0 { print!(" -> "); }
+                                            print!("{}", t.name);
+                                        }
+                                        println!();
+                                        
+                                        // 各タスクの実行コマンド内容もあわせて視覚化
+                                        for t in ordered_tasks {
+                                            println!("  └── [{}] Command: {}", t.name, t.command);
+                                        }
+                                    }
+                                    Err(graph_err) => {
+                                        eprintln!("[AS {}] ✗ グラフ解析失敗（循環参照などの不整合）: {}", my_as_id, graph_err);
+                                    }
+                                }
+                            }
+                            Err(json_err) => {
+                                eprintln!("[AS {}] ✗ ペイロードが有効なタスク定義（JSON）ではありません: {:?}", my_as_id, json_err);
+                                // 互換性維持のため、デシリアライズ失敗時は生テキストとしてダンプ
+                                println!("└── Raw Data Dump: {}", String::from_utf8_lossy(&packet.payload));
+                            }
+                        }
                     }
                 }
             }
