@@ -6,15 +6,16 @@ use ninja::platform::udp::UdpTransport;
 use ninja::platform::abstraction::Transport;
 use ninja::core::packet::{NinjaPacket, FLAG_ACK};
 use core::graph::{Task, resolve_execution_order};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 
-// タスクの実行状態を管理する列挙型
+// 【プロ仕様化 ①】タスクのライフサイクル状態を厳密に定義
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TaskStatus {
     Pending,
     Done,
+    Failed,
 }
 
 fn main() {
@@ -34,7 +35,7 @@ fn main() {
     println!("  Listening on 127.0.0.1:{}", listen_port);
     println!("=============================================");
 
-    // 起動時セルフテスト（整合性チェックは残す）
+    // 起動時セルフテスト
     println!("\n[Self-Test] 依存関係グラフ解析を実行中...");
     let test_tasks = vec![
         Task { name: "deploy".to_string(), deps: vec!["build".to_string(), "test".to_string()], command: "echo 'Deploying...'".to_string() },
@@ -92,13 +93,7 @@ fn main() {
                             Ok(received_tasks) => {
                                 println!("[AS {}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_as_id);
                                 
-                                // 1. 事前の循環参照チェック（防衛線）
-                                if let Err(graph_err) = resolve_execution_order(&received_tasks) {
-                                    eprintln!("[AS {}] ✗ 処理不可能なグラフです: {}", my_as_id, graph_err);
-                                    continue;
-                                }
-
-                                // 2. エンジンの状態管理（State）を初期化
+                                // 【プロ仕様化 ①】明示的なタスク状態管理（State）の初期化
                                 let mut task_states: HashMap<String, TaskStatus> = received_tasks
                                     .iter()
                                     .map(|t| (t.name.clone(), TaskStatus::Pending))
@@ -106,18 +101,18 @@ fn main() {
 
                                 println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
 
-                                // 3. 真のDAGスケジュールループ
                                 loop {
                                     let mut progress = false;
                                     let mut ready_tasks = Vec::new();
 
-                                    // 現在実行可能なタスク（Pendingかつ、すべての依存タスクがDone）をスキャン
+                                    // 実行可能なタスクのスキャン
                                     for task in &received_tasks {
-                                        if task_states.get(&task.name) == Some(&TaskStatus::Done) {
+                                        // すでに完了、または失敗しているタスクはスキップ
+                                        if task_states.get(&task.name) != Some(&TaskStatus::Pending) {
                                             continue;
                                         }
 
-                                        // すべての依存先（deps）がDoneになっているか判定
+                                        // すべての依存タスク（deps）が「Done」状態であるか検証
                                         let is_ready = task.deps.iter().all(|dep| {
                                             task_states.get(dep) == Some(&TaskStatus::Done)
                                         });
@@ -127,9 +122,7 @@ fn main() {
                                         }
                                     }
 
-                                    // 実行可能タスクがある場合、それを実行（本来ここは並列化できるポイント）
                                     if !ready_tasks.is_empty() {
-                                        // 並列性の可視化のために、同時に実行可能になったタスク群を表示
                                         if ready_tasks.len() > 1 {
                                             let names: Vec<String> = ready_tasks.iter().map(|t| t.name.clone()).collect();
                                             println!("  [⚡ Parallel Ready] 同時実行可能なタスク群を検知: {:?}", names);
@@ -138,24 +131,47 @@ fn main() {
                                         for task in ready_tasks {
                                             println!("  ⚡ [Execute] ➔ [{}] Running: {}", task.name, task.command);
                                             
-                                            // ここでタスクの状態を更新（Doneへ遷移）
-                                            task_states.insert(task.name.clone(), TaskStatus::Done);
+                                            // ここで実際のコマンド実行処理のダミー（現状は必ず成功扱い）
+                                            // 将来的に成否を判断して Failed に落とす差し込み口になります
+                                            let success = true; 
+
+                                            if success {
+                                                task_states.insert(task.name.clone(), TaskStatus::Done);
+                                            } else {
+                                                task_states.insert(task.name.clone(), TaskStatus::Failed);
+                                                println!("  ❌ [Execute] ➔ [{}] Failed", task.name);
+                                            }
                                             progress = true;
                                         }
                                     }
 
-                                    // 1周の間で1つも進捗がなければ、すべての依存が解決したか、あるいはデッドロック
+                                    // これ以上進捗がない場合はループを抜ける
                                     if !progress {
                                         break;
                                     }
                                 }
 
-                                // 最終状態の確認
-                                let all_done = task_states.values().all(|s| *s == TaskStatus::Done);
-                                if all_done {
+                                // 【プロ仕様化 ②】ループ停止後の判定とデッドロック（循環依存）の検出
+                                let mut pending_tasks = Vec::new();
+                                let mut failed_tasks = Vec::new();
+
+                                for (name, status) in &task_states {
+                                    match status {
+                                        TaskStatus::Pending => pending_tasks.push(name.clone()),
+                                        TaskStatus::Failed => failed_tasks.push(name.clone()),
+                                        TaskStatus::Done => {}
+                                    }
+                                }
+
+                                if pending_tasks.is_empty() && failed_tasks.is_empty() {
                                     println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
+                                } else if !failed_tasks.is_empty() {
+                                    println!("❌ [Ninja Engine] タスクの実行に失敗したため、後続処理を中断しました。失敗タスク: {:?}", failed_tasks);
                                 } else {
-                                    println!("🛑 [Ninja Engine] 未解決のタスクが残っています（デッドロックの可能性）。\n");
+                                    // 進捗が止まったのにPendingが残っている ＝ 循環参照がある、もしくは未定義のタスクに依存している
+                                    println!("🛑 [Ninja Engine] 致命的エラー: デッドロック（循環依存または未定義の依存関係）を検出しました。");
+                                    println!("  └── 実行不可能なタスク群: {:?}", pending_tasks);
+                                    println!();
                                 }
                             }
                             Err(json_err) => {
