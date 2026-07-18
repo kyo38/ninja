@@ -3,7 +3,7 @@
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
@@ -43,19 +43,23 @@ impl Executor for LocalExecutor {
     }
 }
 
-/// 🛡️ Tokioの非同期プリミティブで再構築された DagScheduler
+/// 📦 アクター（メインループ）に送るメッセージの定義
+enum Event {
+    /// タスクが完了した通知 (タスク名, 成否)
+    TaskFinished(String, bool),
+}
+
+/// 🛡️ Mutex / RwLock を完全に排除した、チャネル駆動型 DagScheduler
 pub struct DagScheduler {
     tasks: HashMap<String, Task>,
     adjacency_list: HashMap<String, Vec<String>>,
-
-    indegrees: Mutex<HashMap<String, usize>>,
-    running_count: Mutex<usize>,
-    total_processed: Mutex<usize>,
-    has_failed: Mutex<bool>,
-    statuses: RwLock<HashMap<String, TaskStatus>>,
-
-    ready_tx: mpsc::UnboundedSender<String>,
-    ready_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    
+    // 初期状態の入次数とステータス（不変データとして保持）
+    initial_indegrees: HashMap<String, usize>,
+    initial_statuses: HashMap<String, TaskStatus>,
+    
+    // 実行時にReadyになったタスクを投入する初期キュー
+    initial_ready_tasks: Vec<String>,
 }
 
 impl DagScheduler {
@@ -87,6 +91,7 @@ impl DagScheduler {
             }
         }
 
+        // サイクル検出 (トポロジカルソートの検証)
         let mut temp_indegrees = base_indegrees.clone();
         let mut validation_queue = VecDeque::new();
         for (name, &deg) in &temp_indegrees {
@@ -96,8 +101,15 @@ impl DagScheduler {
         }
 
         let mut sorted_count = 0;
+        let mut initial_ready_tasks = Vec::new();
         while let Some(u) = validation_queue.pop_front() {
             sorted_count += 1;
+            if *temp_indegrees.get(&u).unwrap() == 0 {
+                // 実際に初期状態で依存ゼロのタスクを収集
+                if *base_indegrees.get(&u).unwrap() == 0 {
+                    initial_ready_tasks.push(u.clone());
+                }
+            }
             if let Some(followers) = adjacency_list.get(&u) {
                 for follower in followers {
                     if let Some(deg) = temp_indegrees.get_mut(follower) {
@@ -114,76 +126,80 @@ impl DagScheduler {
             return Err(SchedulerError::CycleDetected);
         }
 
-        let (ready_tx, ready_rx) = mpsc::unbounded_channel();
-        for (name, &deg) in &base_indegrees {
-            if deg == 0 {
-                ready_tx.send(name.clone()).unwrap();
-            }
-        }
-
         Ok(DagScheduler {
             tasks,
             adjacency_list,
-            indegrees: Mutex::new(base_indegrees),
-            running_count: Mutex::new(0),
-            total_processed: Mutex::new(0),
-            has_failed: Mutex::new(false),
-            statuses: RwLock::new(statuses),
-            ready_tx,
-            ready_rx: Mutex::new(Some(ready_rx)),
+            initial_indegrees: base_indegrees,
+            initial_statuses: statuses,
+            initial_ready_tasks,
         })
     }
 
-    /// 🔄 完全非同期駆動のメインループ
-    pub async fn run(self: Arc<Self>, executor: Arc<dyn Executor>) {
-        let (notify_tx, mut notify_rx) = mpsc::channel::<(String, bool)>(1024);
-        let mut ready_rx = self.ready_rx.lock().await.take().expect("ready_rx has already been taken");
+    /// 🔄 状態をローカルに閉じ込めた、完全メッセージ駆動のメインループ
+    pub async fn run(self, executor: Arc<dyn Executor>) {
+        println!("🚀 [Ninja Engine] --- ロックフリー・チャネル駆動タスクループ開始 ---");
 
-        println!("🚀 [Ninja Engine] --- 完全非同期タスクループ開始 ---");
+        // 📝 状態（State）はすべてこの関数内のローカル変数として管理。ロックは一切不要
+        let mut indegrees = self.initial_indegrees;
+        let mut statuses = self.initial_statuses;
+        let mut running_count = 0;
+        let mut has_failed = false;
+
+        // タスク完了イベントを集約するメインチャネル
+        let (event_tx, mut event_rx) = mpsc::channel::<Event>(1024);
+        
+        // 実行可能（Ready）になったタスクを管理する内部キュー
+        let mut ready_queue = VecDeque::from(self.initial_ready_tasks);
 
         loop {
-            let failed = *self.has_failed.lock().await;
-
-            if !failed {
-                while let Ok(task_name) = ready_rx.try_recv() {
+            // 1. エラーが発生していなければ、Readyなタスクを可能な限りすべてSpawnする
+            if !has_failed {
+                while let Some(task_name) = ready_queue.pop_front() {
                     let task = self.tasks.get(&task_name).unwrap().clone();
-                    let notify_tx_clone = notify_tx.clone();
+                    let event_tx_clone = event_tx.clone();
                     let exec_clone = Arc::clone(&executor);
 
-                    self.statuses.write().await.insert(task_name.clone(), TaskStatus::Running);
-                    *self.running_count.lock().await += 1;
+                    statuses.insert(task_name.clone(), TaskStatus::Running);
+                    running_count += 1;
 
+                    // バックグラウンドで非同期実行。終わったらチャネルにイベントを投げるだけ
                     tokio::spawn(async move {
                         let success = exec_clone.execute(&task).await;
-                        let _ = notify_tx_clone.send((task.name, success)).await;
+                        let _ = event_tx_clone.send(Event::TaskFinished(task.name, success)).await;
                     });
                 }
             }
 
-            if *self.running_count.lock().await == 0 && ready_rx.is_empty() {
+            // 2. 稼働中のタスクがなく、Readyキューも空なら全グラフ終了
+            if running_count == 0 && ready_queue.is_empty() {
                 break;
             }
 
-            if let Some((finished_task, success)) = notify_rx.recv().await {
-                *self.running_count.lock().await -= 1;
-                *self.total_processed.lock().await += 1;
+            // 3. メッセージ待ち受信用アクターコア
+            // ロックを一切取らず、チャネルから流れてくるイベントのみで状態を安全に更新
+            if let Some(event) = event_rx.recv().await {
+                match event {
+                    Event::TaskFinished(finished_task, success) => {
+                        running_count -= 1;
 
-                if !success {
-                    *self.has_failed.lock().await = true;
-                    self.statuses.write().await.insert(finished_task.clone(), TaskStatus::Failed);
-                    println!("❌ [Ninja Engine] タスク [{}] が失敗しました。後続の発火を停止します。", finished_task);
-                    continue;
-                }
+                        if !success {
+                            has_failed = true;
+                            statuses.insert(finished_task.clone(), TaskStatus::Failed);
+                            println!("❌ [Ninja Engine] タスク [{}] が失敗しました。後続の発火を停止します。", finished_task);
+                            continue;
+                        }
 
-                self.statuses.write().await.insert(finished_task.clone(), TaskStatus::Done);
+                        statuses.insert(finished_task.clone(), TaskStatus::Done);
 
-                if let Some(followers) = self.adjacency_list.get(&finished_task) {
-                    let mut indeg_guard = self.indegrees.lock().await;
-                    for follower in followers {
-                        if let Some(deg) = indeg_guard.get_mut(follower) {
-                            *deg -= 1;
-                            if *deg == 0 {
-                                self.ready_tx.send(follower.clone()).unwrap();
+                        // 後続タスクの依存度（入次数）を下げる
+                        if let Some(followers) = self.adjacency_list.get(&finished_task) {
+                            for follower in followers {
+                                if let Some(deg) = indegrees.get_mut(follower) {
+                                    *deg -= 1;
+                                    if *deg == 0 {
+                                        ready_queue.push_back(follower.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -191,11 +207,8 @@ impl DagScheduler {
             }
         }
 
-        self.report_result().await;
-    }
-
-    async fn report_result(&self) {
-        if *self.has_failed.lock().await {
+        // 結果報告
+        if has_failed {
             println!("❌ [Ninja Engine] 一部タスクのエラーにより、実行が中断されました。");
         } else {
             println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");

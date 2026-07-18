@@ -3,13 +3,10 @@
 use std::sync::Arc;
 use ninja::core::graph::{DagScheduler, LocalExecutor, Task};
 
-/// Tokio非同期ランタイムのエントリーポイント
 #[tokio::main]
 async fn main() {
-    println!("=== Ninja DAG Engine (Async Mode) ===");
+    println!("=== Ninja DAG Engine (Actor Mode) ===");
 
-    // テスト用のサンプルDAGタスク群を構築
-    // A, B -> C -> D の依存関係
     let tasks = vec![
         Task {
             name: "Task_A".to_string(),
@@ -40,10 +37,9 @@ async fn main() {
             println!("✓ グラフの整合性チェック通過 (サイクルなし)");
             
             let executor = Arc::new(LocalExecutor);
-            let scheduler_arc = Arc::new(scheduler);
 
-            // 非同期メインループを await で実行
-            scheduler_arc.run(executor).await;
+            // 💡 Arcでのラップを完全に撤廃し、所有権(self)をそのまま渡してアクターを駆動します
+            scheduler.run(executor).await;
         }
         Err(e) => {
             eprintln!("❌ スケジューラの初期化に失敗しました: {:?}", e);
