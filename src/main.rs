@@ -6,23 +6,14 @@ use ninja::platform::udp::UdpTransport;
 use ninja::platform::abstraction::Transport;
 use ninja::core::packet::{NinjaPacket, FLAG_ACK};
 use core::graph::{Task, resolve_execution_order, Executor, LocalExecutor};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum TaskStatus {
-    Pending,
-    Running,
-    Done,
-    Failed,
-}
-
 fn main() {
-    // コマンドライン引数の処理
     let args: Vec<String> = env::args().collect();
     
     let (my_as_id, listen_port) = if args.len() >= 3 {
@@ -99,131 +90,115 @@ fn main() {
                                 println!("[AS {my_id}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_id = my_as_id);
                                 
                                 // =========================================================
-                                // 🛠️ 1. イニシャルリセット（状態の初期化）
+                                // 🛠️ 1. イニシャルリセット（データ構造の構築）
                                 // =========================================================
-                                let raw_states: HashMap<String, TaskStatus> = received_tasks
-                                    .iter()
-                                    .map(|t| (t.name.clone(), TaskStatus::Pending))
-                                    .collect();
-                                let task_states = Arc::new(Mutex::new(raw_states));
-                                let (tx, rx) = mpsc::channel::<String>();
+                                let mut indegrees = HashMap::new();
+                                let mut adjacency_list = HashMap::new();
+                                let mut task_map = HashMap::new();
+
+                                // タスク名から実体を引くマップと、隣接リストの初期化
+                                for task in &received_tasks {
+                                    task_map.insert(task.name.clone(), task.clone());
+                                    indegrees.insert(task.name.clone(), task.deps.len());
+                                    adjacency_list.insert(task.name.clone(), Vec::new());
+                                }
+
+                                // 依存関係の逆引き（隣接リスト）を構築
+                                // 例: codegen が終わったら -> [build, test] の indegree を減らす
+                                for task in &received_tasks {
+                                    for dep in &task.deps {
+                                        if let Some(list) = adjacency_list.get_mut(dep) {
+                                            list.push(task.name.clone());
+                                        }
+                                    }
+                                }
+
+                                // 💡 超重要：初期状態で依存ゼロ（indegree == 0）のタスクを Ready Queue に投入
+                                let mut ready_queue = VecDeque::new();
+                                for (name, &deg) in &indegrees {
+                                    if deg == 0 {
+                                        ready_queue.push_back(name.clone());
+                                    }
+                                }
+
+                                let (tx, rx) = mpsc::channel::<(String, bool)>(); // (タスク名, 成功フラグ)
+                                let mut running_count = 0;
+                                let mut total_processed = 0;
+                                let mut has_failed = false;
 
                                 println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
 
                                 // =========================================================
-                                // 🔄 2. メインループ（「イベント」のみで駆動する設計）
+                                // 🔄 2. メインループ（Ready Queue とイベントカウンタによる純粋駆動）
                                 // =========================================================
-                                let mut is_deadlocked = false;
-
                                 loop {
-                                    let mut ready_tasks = Vec::new();
-                                    let mut has_running = false;
-                                    let mut has_pending = false;
-
-                                    // 現在の状態から「次に叩けるタスク」を探索
-                                    {
-                                        let states = task_states.lock().unwrap();
-                                        for task in &received_tasks {
-                                            match states.get(&task.name) {
-                                                Some(&TaskStatus::Pending) => {
-                                                    has_pending = true;
-                                                    let is_ready = task.deps.iter().all(|dep| {
-                                                        states.get(dep) == Some(&TaskStatus::Done)
-                                                    });
-                                                    if is_ready {
-                                                        ready_tasks.push(task.clone());
-                                                    }
-                                                }
-                                                Some(&TaskStatus::Running) => {
-                                                    has_running = true;
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-
-                                    // 動かせるタスクがあれば、スレッドを一斉起動（投げっぱなしにせず、状態をRunningに固定）
-                                    if !ready_tasks.is_empty() {
-                                        if ready_tasks.len() > 1 {
-                                            let names: Vec<String> = ready_tasks.iter().map(|t| t.name.clone()).collect();
+                                    // エラー発生時は新規タスクの起動をストップ
+                                    if !has_failed {
+                                        // 💡 Ready Queue にあるタスクを「あるだけ全部」一斉にスレッド起動（真の並列化）
+                                        if ready_queue.len() > 1 {
+                                            let names: Vec<String> = ready_queue.iter().cloned().collect();
                                             println!("  [⚡ Parallel Ready] 同時並列実行を開始します: {:?}", names);
                                         }
 
-                                        for task in ready_tasks {
-                                            {
-                                                let mut states = task_states.lock().unwrap();
-                                                states.insert(task.name.clone(), TaskStatus::Running);
-                                            }
-
+                                        while let Some(task_name) = ready_queue.pop_front() {
+                                            let task = task_map.get(&task_name).unwrap().clone();
                                             let tx_clone = tx.clone();
                                             let exec_clone = Arc::clone(&executor);
-                                            let states_clone = Arc::clone(&task_states);
+
+                                            running_count += 1;
 
                                             thread::spawn(move || {
                                                 let success = exec_clone.execute(&task);
-                                                {
-                                                    let mut states = states_clone.lock().unwrap();
-                                                    if success {
-                                                        states.insert(task.name.clone(), TaskStatus::Done);
-                                                    } else {
-                                                        states.insert(task.name.clone(), TaskStatus::Failed);
-                                                    }
-                                                }
-                                                // 【重要】タスクが完了したという「イベント」をメインに送信
-                                                let _ = tx_clone.send(task.name);
+                                                let _ = tx_clone.send((task.name, success));
                                             });
                                         }
-                                        
-                                        // ★修正ポイント: スレッドを投げたら、直後に continue で即時再スキャンするのをやめ、
-                                        // そのまま下の「完了通知待ち（rx.recv）」へ流れ込ませます。
-                                        // これにより、余分な空転ループが完全に排除されます。
-                                        has_running = true; 
                                     }
 
-                                    // デッドロックチェック：未実行タスクがあるのに、現在走っているスレッドもない場合
-                                    if has_pending && !has_running {
-                                        is_deadlocked = true;
+                                    // 終了判定：走っているスレッドがなく、Ready Queue も空
+                                    if running_count == 0 {
                                         break;
                                     }
 
-                                    // 全て完了：未実行もなく、走っているスレッドもないなら安全に終了
-                                    if !has_pending && !has_running {
-                                        break;
-                                    }
+                                    // 💡 イベント待ち：Workerスレッドからの完了通知が届くまで「完全沈黙」
+                                    if let Ok((finished_task, success)) = rx.recv() {
+                                        running_count -= 1;
+                                        total_processed += 1;
 
-                                    // 👉 【真のイベント駆動】バックグラウンドで走っている処理があるなら、
-                                    // いずれかのWorkerから「完了通知（イベント）」が飛んでくるまで、ここで完全にスリープします。
-                                    if has_running {
-                                        if let Ok(finished_task) = rx.recv() {
-                                            // 通知を受け取ったら、ループの先頭に戻って「そのイベントによって新しくReadyになったタスク」を1回だけスキャンします。
-                                            let _ = finished_task;
+                                        if !success {
+                                            has_failed = true;
+                                            println!("❌ [Ninja Engine] タスク [{}] が失敗しました。後続の発火を停止します。", finished_task);
+                                            continue;
+                                        }
+
+                                        // 💡 イベント駆動の核心：完了したタスクの「後続ノード」の indegree をデクリメント
+                                        if let Some(followers) = adjacency_list.get(&finished_task) {
+                                            for follower in followers {
+                                                if let Some(deg) = indegrees.get_mut(follower) {
+                                                    *deg -= 1;
+                                                    // 依存数が 0 になった瞬間、即座に Ready Queue へ昇格！
+                                                    if *deg == 0 {
+                                                        ready_queue.push_back(follower.clone());
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
 
                                 // =========================================================
-                                // 🏁 3. 終了処理（結果判定とエラーハンドリング）
+                                // 🏁 3. 終了処理（状態の判定）
                                 // =========================================================
-                                let mut pending_tasks = Vec::new();
-                                let mut failed_tasks = Vec::new();
-
-                                {
-                                    let states = task_states.lock().unwrap();
-                                    for (name, status) in states.iter() {
-                                        match status {
-                                            TaskStatus::Pending | TaskStatus::Running => pending_tasks.push(name.clone()),
-                                            TaskStatus::Failed => failed_tasks.push(name.clone()),
-                                            TaskStatus::Done => {}
-                                        }
-                                    }
-                                }
-
-                                if is_deadlocked {
-                                    println!("🛑 [Ninja Engine] 致命的エラー: デッドロック（循環依存または未定義の依存関係）を検出しました。");
-                                    println!("  └── 実行不可能なタスク群: {:?}", pending_tasks);
+                                if has_failed {
+                                    println!("❌ [Ninja Engine] 一部タスクのエラーにより、実行が中断されました。");
+                                } else if total_processed < received_tasks.len() {
+                                    // 全タスク数に満たないのにループが終わった＝グラフに未解消の依存（循環参照）がある
+                                    println!("🛑 [Ninja Engine] 致命的エラー: デッドロックを検出しました。循環依存の可能性があります。");
+                                    let unresolved: Vec<String> = indegrees.iter()
+                                        .filter(|&(_, &deg)| deg > 0)
+                                        .map(|(name, _)| name.clone())
+                                        .collect();
+                                    println!("  └── 実行不可能（依存未解消）なタスク群: {:?}", unresolved);
                                     println!();
-                                } else if !failed_tasks.is_empty() {
-                                    println!("❌ [Ninja Engine] タスクの実行に失敗したため、後続処理を中断しました。失敗タスク: {:?}", failed_tasks);
                                 } else {
                                     println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
                                 }
