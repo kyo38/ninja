@@ -96,7 +96,6 @@ fn main() {
                         
                         match serde_json::from_slice::<Vec<Task>>(&packet.payload) {
                             Ok(received_tasks) => {
-                                // 修正点 ①: 明示的な名前付き引数に変更
                                 println!("[AS {my_id}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_id = my_as_id);
                                 
                                 // =========================================================
@@ -107,12 +106,14 @@ fn main() {
                                     .map(|t| (t.name.clone(), TaskStatus::Pending))
                                     .collect();
                                 let task_states = Arc::new(Mutex::new(raw_states));
-                                let (tx, rx) = mpsc::channel::<(String, bool)>();
+                                
+                                // 完全イベント駆動用の完了通知チャネル (タスク名)
+                                let (tx, rx) = mpsc::channel::<String>();
 
                                 println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
 
                                 // =========================================================
-                                // 🔄 2. メメインループ（イベント駆動型DAG実行）
+                                // 🔄 2. メインループ（完全イベント駆動型・制御された並列）
                                 // =========================================================
                                 let mut is_deadlocked = false;
 
@@ -121,6 +122,7 @@ fn main() {
                                     let mut has_running = false;
                                     let mut has_pending = false;
 
+                                    // 【Scheduler】状態をスキャンして Pending ＆ 依存クリアなタスクを探す
                                     {
                                         let states = task_states.lock().unwrap();
                                         for task in &received_tasks {
@@ -142,6 +144,7 @@ fn main() {
                                         }
                                     }
 
+                                    // 👉 【Scheduler ➔ Worker】発火処理
                                     if !ready_tasks.is_empty() {
                                         if ready_tasks.len() > 1 {
                                             let names: Vec<String> = ready_tasks.iter().map(|t| t.name.clone()).collect();
@@ -149,6 +152,7 @@ fn main() {
                                         }
 
                                         for task in ready_tasks {
+                                            // 1手目：Scheduler側で即座に Running へロック固定（二重起動の完全防御）
                                             {
                                                 let mut states = task_states.lock().unwrap();
                                                 states.insert(task.name.clone(), TaskStatus::Running);
@@ -156,33 +160,49 @@ fn main() {
 
                                             let tx_clone = tx.clone();
                                             let exec_clone = Arc::clone(&executor);
+                                            let states_clone = Arc::clone(&task_states);
 
+                                            // Workerスレッドの起動
                                             thread::spawn(move || {
+                                                // タスク実行
                                                 let success = exec_clone.execute(&task);
-                                                let _ = tx_clone.send((task.name, success));
+                                                
+                                                // 2手目：Workerスレッド自身が責任を持って自分の状態を更新
+                                                {
+                                                    let mut states = states_clone.lock().unwrap();
+                                                    if success {
+                                                        states.insert(task.name.clone(), TaskStatus::Done);
+                                                    } else {
+                                                        states.insert(task.name.clone(), TaskStatus::Failed);
+                                                    }
+                                                }
+
+                                                // 3手目：更新が終わったことをチャネルで通知 (notify)
+                                                let _ = tx_clone.send(task.name);
                                             });
                                         }
+                                        // 新しいスレッドを起こしたら、即座に次の状態を確認するためループの頭へ戻る
                                         continue;
                                     }
 
+                                    // 👉 【Worker ➔ Scheduler】チャネルでの完了通知待ち
+                                    // 実行中のもの（Running）があれば、通知が来るまでCPUを1ミリも使わずに完全ブロック待機
                                     if has_running {
-                                        if let Ok((finished_task, success)) = rx.recv() {
-                                            let mut states = task_states.lock().unwrap();
-                                            if success {
-                                                states.insert(finished_task, TaskStatus::Done);
-                                            } else {
-                                                states.insert(finished_task, TaskStatus::Failed);
-                                            }
+                                        if let Ok(finished_task) = rx.recv() {
+                                            // 誰かが終わったログ（※状態更新はWorker側で既に完了している）
+                                            // これをトリガーに次の周回が回り、依存が外れた次のタスクがPendingからReadyになります
+                                            let _ = finished_task; // 変数利用の明示
                                             continue;
                                         }
                                     }
 
-                                    // 修正点 ②: フラグの評価を厳密に行いデッドロックを検知
+                                    // デッドロック検知（動けないPendingがあるのに、走っているスレッドもない）
                                     if has_pending && !has_running {
                                         is_deadlocked = true;
                                         break;
                                     }
 
+                                    // 実行中のタスクも未実行のタスクもなければ、安全に正常終了
                                     if !has_running {
                                         break;
                                     }
