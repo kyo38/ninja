@@ -106,14 +106,12 @@ fn main() {
                                     .map(|t| (t.name.clone(), TaskStatus::Pending))
                                     .collect();
                                 let task_states = Arc::new(Mutex::new(raw_states));
-                                
-                                // 完全イベント駆動用の完了通知チャネル (タスク名)
                                 let (tx, rx) = mpsc::channel::<String>();
 
                                 println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
 
                                 // =========================================================
-                                // 🔄 2. メインループ（完全イベント駆動型・制御された並列）
+                                // 🔄 2. メインループ（「イベント」のみで駆動する設計）
                                 // =========================================================
                                 let mut is_deadlocked = false;
 
@@ -122,7 +120,7 @@ fn main() {
                                     let mut has_running = false;
                                     let mut has_pending = false;
 
-                                    // 【Scheduler】状態をスキャンして Pending ＆ 依存クリアなタスクを探す
+                                    // 現在の状態から「次に叩けるタスク」を探索
                                     {
                                         let states = task_states.lock().unwrap();
                                         for task in &received_tasks {
@@ -144,7 +142,7 @@ fn main() {
                                         }
                                     }
 
-                                    // 👉 【Scheduler ➔ Worker】発火処理
+                                    // 動かせるタスクがあれば、スレッドを一斉起動（投げっぱなしにせず、状態をRunningに固定）
                                     if !ready_tasks.is_empty() {
                                         if ready_tasks.len() > 1 {
                                             let names: Vec<String> = ready_tasks.iter().map(|t| t.name.clone()).collect();
@@ -152,7 +150,6 @@ fn main() {
                                         }
 
                                         for task in ready_tasks {
-                                            // 1手目：Scheduler側で即座に Running へロック固定（二重起動の完全防御）
                                             {
                                                 let mut states = task_states.lock().unwrap();
                                                 states.insert(task.name.clone(), TaskStatus::Running);
@@ -162,12 +159,8 @@ fn main() {
                                             let exec_clone = Arc::clone(&executor);
                                             let states_clone = Arc::clone(&task_states);
 
-                                            // Workerスレッドの起動
                                             thread::spawn(move || {
-                                                // タスク実行
                                                 let success = exec_clone.execute(&task);
-                                                
-                                                // 2手目：Workerスレッド自身が責任を持って自分の状態を更新
                                                 {
                                                     let mut states = states_clone.lock().unwrap();
                                                     if success {
@@ -176,35 +169,35 @@ fn main() {
                                                         states.insert(task.name.clone(), TaskStatus::Failed);
                                                     }
                                                 }
-
-                                                // 3手目：更新が終わったことをチャネルで通知 (notify)
+                                                // 【重要】タスクが完了したという「イベント」をメインに送信
                                                 let _ = tx_clone.send(task.name);
                                             });
                                         }
-                                        // 新しいスレッドを起こしたら、即座に次の状態を確認するためループの頭へ戻る
-                                        continue;
+                                        
+                                        // ★修正ポイント: スレッドを投げたら、直後に continue で即時再スキャンするのをやめ、
+                                        // そのまま下の「完了通知待ち（rx.recv）」へ流れ込ませます。
+                                        // これにより、余分な空転ループが完全に排除されます。
+                                        has_running = true; 
                                     }
 
-                                    // 👉 【Worker ➔ Scheduler】チャネルでの完了通知待ち
-                                    // 実行中のもの（Running）があれば、通知が来るまでCPUを1ミリも使わずに完全ブロック待機
-                                    if has_running {
-                                        if let Ok(finished_task) = rx.recv() {
-                                            // 誰かが終わったログ（※状態更新はWorker側で既に完了している）
-                                            // これをトリガーに次の周回が回り、依存が外れた次のタスクがPendingからReadyになります
-                                            let _ = finished_task; // 変数利用の明示
-                                            continue;
-                                        }
-                                    }
-
-                                    // デッドロック検知（動けないPendingがあるのに、走っているスレッドもない）
+                                    // デッドロックチェック：未実行タスクがあるのに、現在走っているスレッドもない場合
                                     if has_pending && !has_running {
                                         is_deadlocked = true;
                                         break;
                                     }
 
-                                    // 実行中のタスクも未実行のタスクもなければ、安全に正常終了
-                                    if !has_running {
+                                    // 全て完了：未実行もなく、走っているスレッドもないなら安全に終了
+                                    if !has_pending && !has_running {
                                         break;
+                                    }
+
+                                    // 👉 【真のイベント駆動】バックグラウンドで走っている処理があるなら、
+                                    // いずれかのWorkerから「完了通知（イベント）」が飛んでくるまで、ここで完全にスリープします。
+                                    if has_running {
+                                        if let Ok(finished_task) = rx.recv() {
+                                            // 通知を受け取ったら、ループの先頭に戻って「そのイベントによって新しくReadyになったタスク」を1回だけスキャンします。
+                                            let _ = finished_task;
+                                        }
                                     }
                                 }
 
