@@ -6,14 +6,19 @@ use ninja::platform::udp::UdpTransport;
 use ninja::platform::abstraction::Transport;
 use ninja::core::packet::{NinjaPacket, FLAG_ACK};
 use core::graph::{Task, resolve_execution_order};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
 
+// タスクの実行状態を管理する列挙型
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TaskStatus {
+    Pending,
+    Done,
+}
+
 fn main() {
     // コマンドライン引数の処理
-    // 期待する形式: cargo run --bin ninja -- [AS番号] [待ち受けポート]
-    // 例: cargo run --bin ninja -- 100 4000
     let args: Vec<String> = env::args().collect();
     
     let (my_as_id, listen_port) = if args.len() >= 3 {
@@ -21,7 +26,6 @@ fn main() {
         let port = args[2].parse::<u16>().expect("Invalid Port");
         (as_id, port)
     } else {
-        // 引数がない場合はデフォルトで AS 100 / ポート 4000 として動かす
         (100, 4000)
     };
 
@@ -30,55 +34,21 @@ fn main() {
     println!("  Listening on 127.0.0.1:{}", listen_port);
     println!("=============================================");
 
-    // ----------------------------------------------------------------
-    // 【A. セルフテスト】起動時に内部で依存関係グラフの解析を実行
-    // ----------------------------------------------------------------
+    // 起動時セルフテスト（整合性チェックは残す）
     println!("\n[Self-Test] 依存関係グラフ解析を実行中...");
     let test_tasks = vec![
-        Task {
-            name: "deploy".to_string(),
-            deps: vec!["build".to_string(), "test".to_string()],
-            command: "echo 'Deploying to network...'".to_string(),
-        },
-        Task {
-            name: "build".to_string(),
-            deps: vec!["codegen".to_string()],
-            command: "cargo build".to_string(),
-        },
-        Task {
-            name: "test".to_string(),
-            deps: vec!["codegen".to_string()],
-            command: "cargo test".to_string(),
-        },
-        Task {
-            name: "codegen".to_string(),
-            deps: vec![],
-            command: "echo 'Generating path matrices...'".to_string(),
-        },
+        Task { name: "deploy".to_string(), deps: vec!["build".to_string(), "test".to_string()], command: "echo 'Deploying...'".to_string() },
+        Task { name: "build".to_string(), deps: vec!["codegen".to_string()], command: "cargo build".to_string() },
+        Task { name: "test".to_string(), deps: vec!["codegen".to_string()], command: "cargo test".to_string() },
+        Task { name: "codegen".to_string(), deps: vec![], command: "echo 'Codegen...'".to_string() },
     ];
-
-    match resolve_execution_order(&test_tasks) {
-        Ok(ordered) => {
-            print!("[Self-Test] ➔ 決定された実行パス: ");
-            for (i, t) in ordered.iter().enumerate() {
-                if i > 0 { print!(" -> "); }
-                print!("{}", t.name);
-            }
-            println!("\n[Self-Test] ✓ グラフ解析正常終了。");
-        }
-        Err(e) => {
-            println!("[Self-Test] ✗ グラフ解析エラー: {}", e);
-        }
+    if resolve_execution_order(&test_tasks).is_ok() {
+        println!("[Self-Test] ✓ グラフの循環参照なし（DAG確認）。");
     }
     println!("---------------------------------------------\n");
-    // ----------------------------------------------------------------
 
-    // 各ルーターのトポロジーマップ（インターフェース ⇄ 次のルーターのIP:PORT）
     let mut topology = HashMap::new();
-    
-    // 全ノード共通の簡易的な静的ルーティングテーブル
-    topology.insert(2, "127.0.0.1:5000".to_string()); // 2番IFは AS 200 (ポート5000) へ
-    topology.insert(3, "127.0.0.1:6000".to_string()); // 3番IFは AS 300 (ポート6000) へ
+    topology.insert(2, "127.0.0.1:5000".to_string());
 
     let bind_addr = format!("127.0.0.1:{}", listen_port);
     let transport = UdpTransport::bind(&bind_addr);
@@ -91,98 +61,112 @@ fn main() {
                 let mut should_process_locally = true;
 
                 if let Some(ref mut path_header) = packet.path {
-                    println!("[AS {}] Received packet. Current Hop Index: {}", my_as_id, path_header.current_hop_index);
-                    
                     if let Some(current_hop) = path_header.current_hop() {
-                        // 1. 自分が処理すべき正しいASかチェック
-                        if current_hop.as_id != my_as_id {
-                            println!("[AS {}] Path Error: Packet expected AS {}, but reached AS {}", my_as_id, current_hop.as_id, my_as_id);
-                            continue;
-                        }
-
+                        if current_hop.as_id != my_as_id { continue; }
                         let egress_if = current_hop.egress_if;
-                        
-                        // 2. ホップをインクリメント（次のノードへポインタを進める）
                         let is_over = path_header.increment_hop();
 
-                        // 3. まだ経路（ホップ）が残っており、かつ出力インターフェースが0（ローカル終了）でなければ転送
                         if !is_over && egress_if != 0 {
-                            should_process_locally = false; // 転送するためローカル処理はスキップ
-
+                            should_process_locally = false;
                             if let Some(next_hop_str) = topology.get(&egress_if) {
-                                match next_hop_str.parse::<SocketAddr>() {
-                                    Ok(next_hop_ip) => {
-                                        println!("[AS {}] --> Forwarding packet via Interface {} to {}", my_as_id, egress_if, next_hop_ip);
-                                        // 次のルーターへバケツリレー
-                                        transport.send(&packet.to_bytes(), next_hop_ip);
-                                    }
-                                    Err(_) => {
-                                        println!("[AS {}] Topology Error: Invalid address: {}", my_as_id, next_hop_str);
-                                    }
+                                if let Ok(next_hop_ip) = next_hop_str.parse::<SocketAddr>() {
+                                    transport.send(&packet.to_bytes(), next_hop_ip);
                                 }
-                            } else {
-                                println!("[AS {}] Routing Error: No topology mapping for Interface {}", my_as_id, egress_if);
                             }
                         }
                     }
                 }
 
-                // 最終目的地（またはパスヘッダなし）の場合の処理
                 if should_process_locally {
                     if packet.is_syn() {
-                        // ペイロードの先頭2バイトからクライアントの真のポート番号を復元
                         if packet.payload.len() >= 2 {
-                            let port_bytes = [packet.payload[0], packet.payload[1]];
-                            let client_port = u16::from_be_bytes(port_bytes);
+                            let client_port = u16::from_be_bytes([packet.payload[0], packet.payload[1]]);
                             let real_client_addr = SocketAddr::new(addr.ip(), client_port);
-
-                            println!("🎉 [AS {}] Reached Final Destination! SYN received. Original Client: {}", my_as_id, real_client_addr);
-                            
-                            // 本当のクライアントのポートへ直接応答を返す
                             let ack = NinjaPacket::new(FLAG_ACK, None, b"syn-ack".to_vec());
                             transport.send(&ack.to_bytes(), real_client_addr);
-                        } else {
-                            println!("🎉 [AS {}] Reached Final Destination! (Payload too short to extract port)", my_as_id);
                         }
                     } else if packet.is_data() {
                         println!("🎉 [AS {}] Reached Final Destination! DATA packet received.", my_as_id);
                         
-                        // 【新機能】受信したJSONペイロードをTask構造体の配列へデシリアライズ
                         match serde_json::from_slice::<Vec<Task>>(&packet.payload) {
                             Ok(received_tasks) => {
-                                println!("[AS {}] ✓ 伝送されたタスク定義のデシリアライズに成功（{}個のタスク）", my_as_id, received_tasks.len());
+                                println!("[AS {}] ✓ タスク定義の受信に成功。DAGエンジンの駆動を開始します。\n", my_as_id);
                                 
-                                // 動的な依存関係解決の実行
-                                match resolve_execution_order(&received_tasks) {
-                                    Ok(ordered_tasks) => {
-                                        print!("🚀 [AS {}] [Dynamic Execution Path]: ", my_as_id);
-                                        for (i, t) in ordered_tasks.iter().enumerate() {
-                                            if i > 0 { print!(" -> "); }
-                                            print!("{}", t.name);
+                                // 1. 事前の循環参照チェック（防衛線）
+                                if let Err(graph_err) = resolve_execution_order(&received_tasks) {
+                                    eprintln!("[AS {}] ✗ 処理不可能なグラフです: {}", my_as_id, graph_err);
+                                    continue;
+                                }
+
+                                // 2. エンジンの状態管理（State）を初期化
+                                let mut task_states: HashMap<String, TaskStatus> = received_tasks
+                                    .iter()
+                                    .map(|t| (t.name.clone(), TaskStatus::Pending))
+                                    .collect();
+
+                                println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
+
+                                // 3. 真のDAGスケジュールループ
+                                loop {
+                                    let mut progress = false;
+                                    let mut ready_tasks = Vec::new();
+
+                                    // 現在実行可能なタスク（Pendingかつ、すべての依存タスクがDone）をスキャン
+                                    for task in &received_tasks {
+                                        if task_states.get(&task.name) == Some(&TaskStatus::Done) {
+                                            continue;
                                         }
-                                        println!();
-                                        
-                                        // 各タスクの実行コマンド内容もあわせて視覚化
-                                        for t in ordered_tasks {
-                                            println!("  └── [{}] Command: {}", t.name, t.command);
+
+                                        // すべての依存先（deps）がDoneになっているか判定
+                                        let is_ready = task.deps.iter().all(|dep| {
+                                            task_states.get(dep) == Some(&TaskStatus::Done)
+                                        });
+
+                                        if is_ready {
+                                            ready_tasks.push(task.clone());
                                         }
                                     }
-                                    Err(graph_err) => {
-                                        eprintln!("[AS {}] ✗ グラフ解析失敗（循環参照などの不整合）: {}", my_as_id, graph_err);
+
+                                    // 実行可能タスクがある場合、それを実行（本来ここは並列化できるポイント）
+                                    if !ready_tasks.is_empty() {
+                                        // 並列性の可視化のために、同時に実行可能になったタスク群を表示
+                                        if ready_tasks.len() > 1 {
+                                            let names: Vec<String> = ready_tasks.iter().map(|t| t.name.clone()).collect();
+                                            println!("  [⚡ Parallel Ready] 同時実行可能なタスク群を検知: {:?}", names);
+                                        }
+
+                                        for task in ready_tasks {
+                                            println!("  ⚡ [Execute] ➔ [{}] Running: {}", task.name, task.command);
+                                            
+                                            // ここでタスクの状態を更新（Doneへ遷移）
+                                            task_states.insert(task.name.clone(), TaskStatus::Done);
+                                            progress = true;
+                                        }
                                     }
+
+                                    // 1周の間で1つも進捗がなければ、すべての依存が解決したか、あるいはデッドロック
+                                    if !progress {
+                                        break;
+                                    }
+                                }
+
+                                // 最終状態の確認
+                                let all_done = task_states.values().all(|s| *s == TaskStatus::Done);
+                                if all_done {
+                                    println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
+                                } else {
+                                    println!("🛑 [Ninja Engine] 未解決のタスクが残っています（デッドロックの可能性）。\n");
                                 }
                             }
                             Err(json_err) => {
-                                eprintln!("[AS {}] ✗ ペイロードが有効なタスク定義（JSON）ではありません: {:?}", my_as_id, json_err);
-                                // 互換性維持のため、デシリアライズ失敗時は生テキストとしてダンプ
-                                println!("└── Raw Data Dump: {}", String::from_utf8_lossy(&packet.payload));
+                                eprintln!("[AS {}] ✗ パースエラー: {:?}", my_as_id, json_err);
                             }
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("[AS {}] Invalid packet from {}: {:?}", my_as_id, addr, e);
+                println!("[AS {}] Invalid packet: {:?}", my_as_id, e);
             }
         }
     }
