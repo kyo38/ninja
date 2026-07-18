@@ -2,9 +2,8 @@
 
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
@@ -21,174 +20,170 @@ pub enum TaskStatus {
     Failed,
 }
 
-pub fn resolve_execution_order(tasks: &[Task]) -> Result<Vec<String>, String> {
-    let mut indegree = HashMap::new();
-    let mut adj = HashMap::new();
-    
-    for task in tasks {
-        indegree.insert(task.name.clone(), 0);
-        adj.insert(task.name.clone(), Vec::new());
-    }
-    
-    for task in tasks {
-        for dep in &task.deps {
-            if !indegree.contains_key(dep) {
-                return Err(format!("Unknown dependency: {}", dep));
-            }
-            if let Some(list) = adj.get_mut(dep) {
-                list.push(task.name.clone());
-            }
-            if let Some(count) = indegree.get_mut(&task.name) {
-                *count += 1;
-            }
-        }
-    }
-    
-    let mut queue = VecDeque::new();
-    for (name, &count) in &indegree {
-        if count == 0 {
-            queue.push_back(name.clone());
-        }
-    }
-    
-    let mut order = Vec::new();
-    while let Some(u) = queue.pop_front() {
-        order.push(u.clone());
-        if let Some(neighbors) = adj.get(&u) {
-            for v in neighbors {
-                if let Some(count) = indegree.get_mut(v) {
-                    *count -= 1;
-                    if *count == 0 {
-                        queue.push_back(v.clone());
-                    }
-                }
-            }
-        }
-    }
-    
-    if order.len() == tasks.len() {
-        Ok(order)
-    } else {
-        Err("Cycle detected or unresolved dependency".to_string())
-    }
+#[derive(Debug, PartialEq)]
+pub enum SchedulerError {
+    CycleDetected,
+    UnknownDependency(String),
 }
 
+/// 🌐 非同期対応したExecutorトレイト
+#[async_trait::async_trait]
 pub trait Executor: Send + Sync {
-    fn execute(&self, task: &Task) -> bool;
+    async fn execute(&self, task: &Task) -> bool;
 }
 
 pub struct LocalExecutor;
+
+#[async_trait::async_trait]
 impl Executor for LocalExecutor {
-    fn execute(&self, task: &Task) -> bool {
+    async fn execute(&self, task: &Task) -> bool {
         println!("  ⚡ [LocalExecute] ➔ [{}] Running: {}", task.name, task.command);
-        thread::sleep(std::time::Duration::from_millis(800));
+        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
         true
     }
 }
 
+/// 🛡️ Tokioの非同期プリミティブで再構築された DagScheduler
 pub struct DagScheduler {
     tasks: HashMap<String, Task>,
-    indegrees: HashMap<String, usize>,
     adjacency_list: HashMap<String, Vec<String>>,
-    statuses: HashMap<String, TaskStatus>,
-    ready_queue: VecDeque<String>,
-    running_count: usize,
-    total_processed: usize,
-    has_failed: bool,
+
+    indegrees: Mutex<HashMap<String, usize>>,
+    running_count: Mutex<usize>,
+    total_processed: Mutex<usize>,
+    has_failed: Mutex<bool>,
+    statuses: RwLock<HashMap<String, TaskStatus>>,
+
+    ready_tx: mpsc::UnboundedSender<String>,
+    ready_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
 }
 
 impl DagScheduler {
-    pub fn new(received_tasks: Vec<Task>) -> Self {
+    pub fn new(received_tasks: Vec<Task>) -> Result<Self, SchedulerError> {
         let mut tasks = HashMap::new();
-        let mut indegrees = HashMap::new();
+        let mut base_indegrees = HashMap::new();
         let mut adjacency_list = HashMap::new();
         let mut statuses = HashMap::new();
 
-        for task in received_tasks {
+        for task in &received_tasks {
             let name = task.name.clone();
-            indegrees.insert(name.clone(), task.deps.len());
+            base_indegrees.insert(name.clone(), 0);
             adjacency_list.insert(name.clone(), Vec::new());
             statuses.insert(name.clone(), TaskStatus::Pending);
-            tasks.insert(name, task);
+            tasks.insert(name, task.clone());
         }
 
-        for task in tasks.values() {
+        for task in &received_tasks {
             for dep in &task.deps {
+                if !tasks.contains_key(dep) {
+                    return Err(SchedulerError::UnknownDependency(dep.clone()));
+                }
                 if let Some(list) = adjacency_list.get_mut(dep) {
                     list.push(task.name.clone());
                 }
+                if let Some(deg) = base_indegrees.get_mut(&task.name) {
+                    *deg += 1;
+                }
             }
         }
 
-        let mut ready_queue = VecDeque::new();
-        for (name, &deg) in &indegrees {
+        let mut temp_indegrees = base_indegrees.clone();
+        let mut validation_queue = VecDeque::new();
+        for (name, &deg) in &temp_indegrees {
             if deg == 0 {
-                ready_queue.push_back(name.clone());
+                validation_queue.push_back(name.clone());
             }
         }
 
-        DagScheduler {
-            tasks,
-            indegrees,
-            adjacency_list,
-            statuses,
-            ready_queue,
-            running_count: 0,
-            total_processed: 0,
-            has_failed: false,
+        let mut sorted_count = 0;
+        while let Some(u) = validation_queue.pop_front() {
+            sorted_count += 1;
+            if let Some(followers) = adjacency_list.get(&u) {
+                for follower in followers {
+                    if let Some(deg) = temp_indegrees.get_mut(follower) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            validation_queue.push_back(follower.clone());
+                        }
+                    }
+                }
+            }
         }
+
+        if sorted_count != received_tasks.len() {
+            return Err(SchedulerError::CycleDetected);
+        }
+
+        let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+        for (name, &deg) in &base_indegrees {
+            if deg == 0 {
+                ready_tx.send(name.clone()).unwrap();
+            }
+        }
+
+        Ok(DagScheduler {
+            tasks,
+            adjacency_list,
+            indegrees: Mutex::new(base_indegrees),
+            running_count: Mutex::new(0),
+            total_processed: Mutex::new(0),
+            has_failed: Mutex::new(false),
+            statuses: RwLock::new(statuses),
+            ready_tx,
+            ready_rx: Mutex::new(Some(ready_rx)),
+        })
     }
 
-    pub fn run(&mut self, executor: Arc<dyn Executor>) {
-        let (tx, rx) = mpsc::channel::<(String, bool)>();
+    /// 🔄 完全非同期駆動のメインループ
+    pub async fn run(self: Arc<Self>, executor: Arc<dyn Executor>) {
+        let (notify_tx, mut notify_rx) = mpsc::channel::<(String, bool)>(1024);
+        let mut ready_rx = self.ready_rx.lock().await.take().expect("ready_rx has already been taken");
 
-        println!("🚀 [Ninja Engine] --- スケジューリングループ開始 ---");
+        println!("🚀 [Ninja Engine] --- 完全非同期タスクループ開始 ---");
 
         loop {
-            if !self.has_failed {
-                if self.ready_queue.len() > 1 {
-                    let names: Vec<String> = self.ready_queue.iter().cloned().collect();
-                    println!("  [⚡ Parallel Ready] 同時並列実行を開始します: {:?}", names);
-                }
+            let failed = *self.has_failed.lock().await;
 
-                while let Some(task_name) = self.ready_queue.pop_front() {
+            if !failed {
+                while let Ok(task_name) = ready_rx.try_recv() {
                     let task = self.tasks.get(&task_name).unwrap().clone();
-                    let tx_clone = tx.clone();
+                    let notify_tx_clone = notify_tx.clone();
                     let exec_clone = Arc::clone(&executor);
 
-                    self.statuses.insert(task_name, TaskStatus::Running);
-                    self.running_count += 1;
+                    self.statuses.write().await.insert(task_name.clone(), TaskStatus::Running);
+                    *self.running_count.lock().await += 1;
 
-                    thread::spawn(move || {
-                        let success = exec_clone.execute(&task);
-                        let _ = tx_clone.send((task.name, success));
+                    tokio::spawn(async move {
+                        let success = exec_clone.execute(&task).await;
+                        let _ = notify_tx_clone.send((task.name, success)).await;
                     });
                 }
             }
 
-            if self.running_count == 0 {
+            if *self.running_count.lock().await == 0 && ready_rx.is_empty() {
                 break;
             }
 
-            if let Ok((finished_task, success)) = rx.recv() {
-                self.running_count -= 1;
-                self.total_processed += 1;
+            if let Some((finished_task, success)) = notify_rx.recv().await {
+                *self.running_count.lock().await -= 1;
+                *self.total_processed.lock().await += 1;
 
                 if !success {
-                    self.has_failed = true;
-                    self.statuses.insert(finished_task.clone(), TaskStatus::Failed);
+                    *self.has_failed.lock().await = true;
+                    self.statuses.write().await.insert(finished_task.clone(), TaskStatus::Failed);
                     println!("❌ [Ninja Engine] タスク [{}] が失敗しました。後続の発火を停止します。", finished_task);
                     continue;
                 }
 
-                self.statuses.insert(finished_task.clone(), TaskStatus::Done);
+                self.statuses.write().await.insert(finished_task.clone(), TaskStatus::Done);
 
                 if let Some(followers) = self.adjacency_list.get(&finished_task) {
+                    let mut indeg_guard = self.indegrees.lock().await;
                     for follower in followers {
-                        if let Some(deg) = self.indegrees.get_mut(follower) {
+                        if let Some(deg) = indeg_guard.get_mut(follower) {
                             *deg -= 1;
                             if *deg == 0 {
-                                self.ready_queue.push_back(follower.clone());
+                                self.ready_tx.send(follower.clone()).unwrap();
                             }
                         }
                     }
@@ -196,22 +191,45 @@ impl DagScheduler {
             }
         }
 
-        self.report_result();
+        self.report_result().await;
     }
 
-    fn report_result(&self) {
-        if self.has_failed {
+    async fn report_result(&self) {
+        if *self.has_failed.lock().await {
             println!("❌ [Ninja Engine] 一部タスクのエラーにより、実行が中断されました。");
-        } else if self.total_processed < self.tasks.len() {
-            println!("🛑 [Ninja Engine] 致命的エラー: デッドロックを検出しました。循環依存の可能性があります。");
-            let unresolved: Vec<String> = self.indegrees.iter()
-                .filter(|&(_, &deg)| deg > 0)
-                .map(|(name, _)| name.clone())
-                .collect();
-            println!("  └── 実行不可能（依存未解消）なタスク群: {:?}", unresolved);
-            println!();
         } else {
             println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
         }
     }
+}
+
+pub fn resolve_execution_order(tasks: &[Task]) -> Result<Vec<String>, String> {
+    let mut indegree = HashMap::new();
+    let mut adj = HashMap::new();
+    for task in tasks {
+        indegree.insert(task.name.clone(), 0);
+        adj.insert(task.name.clone(), Vec::new());
+    }
+    for task in tasks {
+        for dep in &task.deps {
+            if !indegree.contains_key(dep) { return Err(format!("Unknown dependency: {}", dep)); }
+            if let Some(list) = adj.get_mut(dep) { list.push(task.name.clone()); }
+            if let Some(count) = indegree.get_mut(&task.name) { *count += 1; }
+        }
+    }
+    let mut queue = VecDeque::new();
+    for (name, &count) in &indegree { if count == 0 { queue.push_back(name.clone()); } }
+    let mut order = Vec::new();
+    while let Some(u) = queue.pop_front() {
+        order.push(u.clone());
+        if let Some(neighbors) = adj.get(&u) {
+            for v in neighbors {
+                if let Some(count) = indegree.get_mut(v) {
+                    *count -= 1;
+                    if *count == 0 { queue.push_back(v.clone()); }
+                }
+            }
+        }
+    }
+    if order.len() == tasks.len() { Ok(order) } else { Err("Cycle detected or unresolved dependency".to_string()) }
 }
