@@ -1,6 +1,11 @@
+// src/main.rs
+pub mod core {
+    pub mod graph;
+}
 use ninja::platform::udp::UdpTransport;
 use ninja::platform::abstraction::Transport;
 use ninja::core::packet::{NinjaPacket, FLAG_ACK};
+use core::graph::{Task, resolve_execution_order};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -24,6 +29,49 @@ fn main() {
     println!("  ninja router/server starting on AS {}...", my_as_id);
     println!("  Listening on 127.0.0.1:{}", listen_port);
     println!("=============================================");
+
+    // ----------------------------------------------------------------
+    // 【A. セルフテスト】起動時に内部で依存関係グラフの解析を実行
+    // ----------------------------------------------------------------
+    println!("\n[Self-Test] 依存関係グラフ解析を実行中...");
+    let test_tasks = vec![
+        Task {
+            name: "deploy".to_string(),
+            deps: vec!["build".to_string(), "test".to_string()],
+            command: "echo 'Deploying to network...'".to_string(),
+        },
+        Task {
+            name: "build".to_string(),
+            deps: vec!["codegen".to_string()],
+            command: "cargo build".to_string(),
+        },
+        Task {
+            name: "test".to_string(),
+            deps: vec!["codegen".to_string()],
+            command: "cargo test".to_string(),
+        },
+        Task {
+            name: "codegen".to_string(),
+            deps: vec![],
+            command: "echo 'Generating path matrices...'".to_string(),
+        },
+    ];
+
+    match resolve_execution_order(&test_tasks) {
+        Ok(ordered) => {
+            print!("[Self-Test] ➔ 決定された実行パス: ");
+            for (i, t) in ordered.iter().enumerate() {
+                if i > 0 { print!(" -> "); }
+                print!("{}", t.name);
+            }
+            println!("\n[Self-Test] ✓ グラフ解析正常終了。");
+        }
+        Err(e) => {
+            println!("[Self-Test] ✗ グラフ解析エラー: {}", e);
+        }
+    }
+    println!("---------------------------------------------\n");
+    // ----------------------------------------------------------------
 
     // 各ルーターのトポロジーマップ（インターフェース ⇄ 次のルーターのIP:PORT）
     let mut topology = HashMap::new();
