@@ -2,6 +2,7 @@
 
 use serde::{Serialize, Deserialize};
 use std::error::Error;
+use std::env;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -77,9 +78,16 @@ async fn execute_command(payload: &WorkerTaskPayload) -> bool {
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("=== Ninja Remote Worker Node ===");
 
-    // 💡 ワーカーは自身のポート（デフォルト: 9000）でマネージャーからのタスク要請を待ち受ける
-    let addr = "127.0.0.1:9000";
-    let listener = TcpListener::bind(addr).await?;
+    // 💡 引数からポート番号を取得。指定がなければ 9000 をデフォルトにする
+    let args: Vec<String> = env::args().collect();
+    let port = if args.len() > 1 {
+        &args[1]
+    } else {
+        "9000"
+    };
+
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
     println!("📡 [Worker] マネージャーからのタスク配分を待機中: {}", addr);
 
     loop {

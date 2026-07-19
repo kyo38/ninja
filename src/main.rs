@@ -62,9 +62,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Ninja Distributed DAG Engine (Manager Mode) ===");
 
     // 💡 SCIONの送信者主導思想に倣い、マネージャー側で利用可能なワーカーの「パス/ルート」を一元管理
-    // 将来的に複数の独立した物理ノード（例: "192.168.1.50:9000", "192.168.1.51:9000"）を並べるだけでスケールします
+    // 2つのポートスロットをアクティブにして同時に独立稼働させます
     let worker_addresses = vec![
         "127.0.0.1:9000".to_string(),
+        "127.0.0.1:9001".to_string(),
     ];
     
     // リモート接続対応の Executor を初期化
@@ -85,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 tokio::spawn(async move {
                     handle_client(stream, exec_clone).await;
-                    println!("🔌 [Ninja Manager] クライアント ( {} ) との通信処理が終了しました。\n", client_addr);
+                    println!("🔌 [Ninja Manager] クライアント ( {} ) ととの通信処理が終了しました。\n", client_addr);
                 });
             }
             Err(e) => {
