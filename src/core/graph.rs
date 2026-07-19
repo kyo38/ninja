@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
@@ -30,65 +31,126 @@ pub enum SchedulerError {
     UnknownDependency(String),
 }
 
-/// 📦 ワーカーへ送信するペイロード構造体 (worker.rsの定義と一致)
-#[derive(Serialize)]
-struct WorkerTaskPayload {
-    name: String,
-    command: String,
-    timeout_secs: u64,
+/// 📦 ワーカーへ送信する各種メッセージの識別子
+#[derive(Serialize, Deserialize)]
+pub enum WorkerMessage {
+    HeartbeatPing,
+    TaskPayload { name: String, command: String, timeout_secs: u64 },
 }
 
-/// 📦 ワーカーから返ってくるレスポンス構造体
-#[derive(Deserialize)]
-struct WorkerResponse {
-    name: String,
-    success: bool,
+/// 📦 ワーカーから返ってくる各種レスポンスの識別子
+#[derive(Serialize, Deserialize)]
+pub enum WorkerResponse {
+    HeartbeatPong,
+    TaskResult { name: String, success: bool },
+}
+
+/// 🌐 内部でのワーカー状態管理構造体
+struct WorkerSlot {
+    address: String,
+    is_busy: bool,
+    is_alive: bool,
 }
 
 /// 🌐 ネットワーク経由でリモートワーカーに処理を Push する Executor
 pub struct RemoteExecutor {
-    // 利用可能なワーカーのIP:PORTリストと、それぞれの使用中フラグを一元管理
-    // マネージャー主導（Push型）で空きスロットを探すためにスレッドセーフにする
-    workers: Arc<Mutex<Vec<(String, bool)>>>,
+    // スロット管理に生存フラグ（is_alive）を追加
+    workers: Arc<Mutex<Vec<WorkerSlot>>>,
 }
 
 impl RemoteExecutor {
     pub fn new(worker_addresses: Vec<String>) -> Self {
-        let workers = worker_addresses.into_iter().map(|addr| (addr, false)).collect();
+        let workers = worker_addresses
+            .into_iter()
+            .map(|addr| WorkerSlot {
+                address: addr,
+                is_busy: false,
+                is_alive: true, // 初期状態は生存と仮定（ハートビートが即座に更新する）
+            })
+            .collect();
         RemoteExecutor {
             workers: Arc::new(Mutex::new(workers)),
         }
     }
 
-    /// 空いているワーカーを1つ確保する (見つかるまでループ)
+    /// 空いていて、かつ「生存している」ワーカーを1つ確保する
     async fn acquire_worker(&self) -> String {
         loop {
             let mut workers = self.workers.lock().await;
-            for (addr, is_busy) in workers.iter_mut() {
-                if !*is_busy {
-                    *is_busy = true; // 使用中にマーク
-                    return addr.clone();
+            for slot in workers.iter_mut() {
+                if slot.is_alive && !slot.is_busy {
+                    slot.is_busy = true;
+                    return slot.address.clone();
                 }
             }
             drop(workers);
-            // 空きがない場合は少し待ってから再試行 (ポーリング)
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
     /// 使い終わったワーカーを解放する
     async fn release_worker(&self, target_addr: &str) {
         let mut workers = self.workers.lock().await;
-        for (addr, is_busy) in workers.iter_mut() {
-            if addr == target_addr {
-                *is_busy = false;
+        for slot in workers.iter_mut() {
+            if slot.address == target_addr {
+                slot.is_busy = false;
                 break;
+            }
+        }
+    }
+
+    /// 💓 バックグラウンドで常時回り続けるハートビート監視ループ
+    pub async fn start_heartbeat_loop(self: Arc<Self>, interval: Duration, check_timeout: Duration) {
+        println!("💓 [Heartbeat] 死活監視アクターを起動しました (間隔: {:?})", interval);
+        
+        loop {
+            tokio::time::sleep(interval).await;
+            let mut workers = self.workers.lock().await;
+            
+            for slot in workers.iter_mut() {
+                let addr = slot.address.clone();
+                
+                // 非同期に各ワーカーへ Ping を打つ
+                let is_now_alive = match timeout(check_timeout, TcpStream::connect(&addr)).await {
+                    Ok(Ok(mut stream)) => {
+                        let ping = match serde_json::to_string(&WorkerMessage::HeartbeatPing) {
+                            Ok(j) => j,
+                            Err(_) => { slot.is_alive = false; continue; }
+                        };
+                        
+                        if stream.write_all(ping.as_bytes()).await.is_err() {
+                            false
+                        } else {
+                            let mut buffer = vec![0; 1024];
+                            match stream.read(&mut buffer).await {
+                                Ok(n) if n > 0 => {
+                                    if let Ok(json_str) = std::str::from_utf8(&buffer[..n]) {
+                                        matches!(serde_json::from_str::<WorkerResponse>(json_str), Ok(WorkerResponse::HeartbeatPong))
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            }
+                        }
+                    }
+                    _ => false, // 接続失敗、またはタイムアウト
+                };
+
+                // 状態変化があった場合のみログ出力
+                if slot.is_alive != is_now_alive {
+                    if is_now_alive {
+                        println!("🟢 [Heartbeat] ワーカーノード ( {} ) の復帰を確認しました。", addr);
+                    } else {
+                        println!("🔴 [Heartbeat] ワーカーノード ( {} ) の切断・ハングアップを検知しました！", addr);
+                    }
+                    slot.is_alive = is_now_alive;
+                }
             }
         }
     }
 }
 
-/// 🌐 非同期対応したExecutorトレイト
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync {
     async fn execute(&self, task: &Task) -> bool;
@@ -106,28 +168,25 @@ impl Executor for RemoteExecutor {
                 println!("🔄 [RemoteExecute] ➔ [{}] リトライを開始します ({}/{})", task.name, attempts - 1, task.max_retries);
             }
 
-            // 1. マネージャー主導で、現在空いているワーカーのルート（パス）を決定して確保
             let worker_addr = self.acquire_worker().await;
             println!("🚀 [RemoteExecute] ➔ [{}] ワーカー( {} ) を割り当てました。タスクを Push 送信します...", task.name, worker_addr);
 
-            // 2. ワーカーへTCP接続を確立
             let mut stream = match TcpStream::connect(&worker_addr).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("❌ [RemoteExecute] ➔ ワーカー( {} ) への接続に失敗しました: {:?}", worker_addr, e);
                     self.release_worker(&worker_addr).await;
-                    continue; // 次の試行（リトライ）へ
+                    continue; 
                 }
             };
 
-            // 3. ペイロードの組み立てとシリアライズ
-            let payload = WorkerTaskPayload {
+            let message = WorkerMessage::TaskPayload {
                 name: task.name.clone(),
                 command: task.command.clone(),
                 timeout_secs: task.timeout_secs,
             };
 
-            let serialized = match serde_json::to_string(&payload) {
+            let serialized = match serde_json::to_string(&message) {
                 Ok(json) => json,
                 Err(e) => {
                     eprintln!("❌ [RemoteExecute] ➔ ペイロードのJSON化に失敗: {:?}", e);
@@ -136,7 +195,6 @@ impl Executor for RemoteExecutor {
                 }
             };
 
-            // 4. ワーカーへコマンドデータを送信 (Push)
             if let Err(e) = stream.write_all(serialized.as_bytes()).await {
                 eprintln!("❌ [RemoteExecute] ➔ ワーカーへのデータ送信失敗: {:?}", e);
                 self.release_worker(&worker_addr).await;
@@ -144,7 +202,6 @@ impl Executor for RemoteExecutor {
             }
             let _ = stream.flush().await;
 
-            // 5. ワーカーからの実行結果の受信待機
             let mut buffer = vec![0; 65536];
             let result = match stream.read(&mut buffer).await {
                 Ok(0) => {
@@ -153,16 +210,17 @@ impl Executor for RemoteExecutor {
                 }
                 Ok(n) => {
                     if let Ok(json_str) = std::str::from_utf8(&buffer[..n]) {
-                        if let Ok(resp) = serde_json::from_str::<WorkerResponse>(json_str) {
-                            if resp.success {
-                                println!("✓ [RemoteExecute] ➔ [{}] ワーカー側で正常終了", task.name);
-                                true
-                            } else {
-                                eprintln!("❌ [RemoteExecute] ➔ [{}] ワーカー側でエラーまたはタイムアウト終了", task.name);
-                                false
+                        match serde_json::from_str::<WorkerResponse>(json_str) {
+                            Ok(WorkerResponse::TaskResult { success, .. }) => {
+                                if success {
+                                    println!("✓ [RemoteExecute] ➔ [{}] ワーカー側で正常終了", task.name);
+                                    true
+                                } else {
+                                    eprintln!("❌ [RemoteExecute] ➔ [{}] ワーカー側でエラーまたはタイムアウト終了", task.name);
+                                    false
+                                }
                             }
-                        } else {
-                            false
+                            _ => false,
                         }
                     } else {
                         false
@@ -174,24 +232,21 @@ impl Executor for RemoteExecutor {
                 }
             };
 
-            // 6. タスク処理が終わったので、ワーカーをプールに返却
             self.release_worker(&worker_addr).await;
 
             if result {
-                return true; // 成功したため終了
+                return true; 
             }
         }
 
-        false // すべてのリトライが失敗
+        false 
     }
 }
 
-/// 📦 アクター（メインループ）に送るメッセージの定義
 enum Event {
     TaskFinished(String, bool),
 }
 
-/// 🛡️ チャネル駆動型 DagScheduler
 pub struct DagScheduler {
     tasks: HashMap<String, Task>,
     adjacency_list: HashMap<String, Vec<String>>,
@@ -229,7 +284,6 @@ impl DagScheduler {
             }
         }
 
-        // サイクル検出 (トポロジカルソートの検証)
         let mut temp_indegrees = base_indegrees.clone();
         let mut validation_queue = VecDeque::new();
         for (name, &deg) in &temp_indegrees {
@@ -272,7 +326,6 @@ impl DagScheduler {
         })
     }
 
-    /// 🔄 完全メッセージ駆動のメインループ
     pub async fn run(self, executor: Arc<dyn Executor>) {
         println!("🚀 [Ninja Engine] --- ロックフリー・チャネル駆動タスクループ開始 ---");
 
