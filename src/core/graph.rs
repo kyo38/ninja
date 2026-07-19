@@ -3,17 +3,17 @@
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::sync::{mpsc, Mutex};
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
     pub deps: Vec<String>,
     pub command: String,
-    pub timeout_secs: u64,    // ⏱️ タイムアウト秒数（0なら無制限）
-    pub max_retries: usize,   // 🔄 最大リトライ回数（0ならリトライなし）
+    pub timeout_secs: u64,
+    pub max_retries: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -30,16 +30,72 @@ pub enum SchedulerError {
     UnknownDependency(String),
 }
 
+/// 📦 ワーカーへ送信するペイロード構造体 (worker.rsの定義と一致)
+#[derive(Serialize)]
+struct WorkerTaskPayload {
+    name: String,
+    command: String,
+    timeout_secs: u64,
+}
+
+/// 📦 ワーカーから返ってくるレスポンス構造体
+#[derive(Deserialize)]
+struct WorkerResponse {
+    name: String,
+    success: bool,
+}
+
+/// 🌐 ネットワーク経由でリモートワーカーに処理を Push する Executor
+pub struct RemoteExecutor {
+    // 利用可能なワーカーのIP:PORTリストと、それぞれの使用中フラグを一元管理
+    // マネージャー主導（Push型）で空きスロットを探すためにスレッドセーフにする
+    workers: Arc<Mutex<Vec<(String, bool)>>>,
+}
+
+impl RemoteExecutor {
+    pub fn new(worker_addresses: Vec<String>) -> Self {
+        let workers = worker_addresses.into_iter().map(|addr| (addr, false)).collect();
+        RemoteExecutor {
+            workers: Arc::new(Mutex::new(workers)),
+        }
+    }
+
+    /// 空いているワーカーを1つ確保する (見つかるまでループ)
+    async fn acquire_worker(&self) -> String {
+        loop {
+            let mut workers = self.workers.lock().await;
+            for (addr, is_busy) in workers.iter_mut() {
+                if !*is_busy {
+                    *is_busy = true; // 使用中にマーク
+                    return addr.clone();
+                }
+            }
+            drop(workers);
+            // 空きがない場合は少し待ってから再試行 (ポーリング)
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 使い終わったワーカーを解放する
+    async fn release_worker(&self, target_addr: &str) {
+        let mut workers = self.workers.lock().await;
+        for (addr, is_busy) in workers.iter_mut() {
+            if addr == target_addr {
+                *is_busy = false;
+                break;
+            }
+        }
+    }
+}
+
 /// 🌐 非同期対応したExecutorトレイト
 #[async_trait::async_trait]
 pub trait Executor: Send + Sync {
     async fn execute(&self, task: &Task) -> bool;
 }
 
-pub struct LocalExecutor;
-
 #[async_trait::async_trait]
-impl Executor for LocalExecutor {
+impl Executor for RemoteExecutor {
     async fn execute(&self, task: &Task) -> bool {
         let mut attempts = 0;
         let max_attempts = task.max_retries + 1;
@@ -47,75 +103,95 @@ impl Executor for LocalExecutor {
         while attempts < max_attempts {
             attempts += 1;
             if attempts > 1 {
-                println!("🔄 [LocalExecute] ➔ [{}] リトライを開始します ({}/{})", task.name, attempts - 1, task.max_retries);
+                println!("🔄 [RemoteExecute] ➔ [{}] リトライを開始します ({}/{})", task.name, attempts - 1, task.max_retries);
             }
 
-            println!(" ⚡ [LocalExecute] ➔ [{}] Running: {}", task.name, task.command);
+            // 1. マネージャー主導で、現在空いているワーカーのルート（パス）を決定して確保
+            let worker_addr = self.acquire_worker().await;
+            println!("🚀 [RemoteExecute] ➔ [{}] ワーカー( {} ) を割り当てました。タスクを Push 送信します...", task.name, worker_addr);
 
-            // 🛠️ Windows/Linux両対応のコマンド実行ロジック
-            let mut cmd = if cfg!(target_os = "windows") {
-                let mut c = Command::new("cmd");
-                c.args(["/C", &task.command]);
-                c
-            } else {
-                let mut c = Command::new("sh");
-                c.args(["-c", &task.command]);
-                c
-            };
-
-            // 標準出力と標準エラーをキャプチャ（バックグラウンドで非同期にパイプ処理）
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-
-            // 1. プロセスの生成
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
+            // 2. ワーカーへTCP接続を確立
+            let mut stream = match TcpStream::connect(&worker_addr).await {
+                Ok(s) => s,
                 Err(e) => {
-                    eprintln!("❌ [LocalExecute] ➔ [{}] プロセスの起動に失敗: {:?}", task.name, e);
-                    continue; // リトライへ
+                    eprintln!("❌ [RemoteExecute] ➔ ワーカー( {} ) への接続に失敗しました: {:?}", worker_addr, e);
+                    self.release_worker(&worker_addr).await;
+                    continue; // 次の試行（リトライ）へ
                 }
             };
 
-            // 2. タイムアウト付きでプロセスの終了を待機
-            let result = if task.timeout_secs > 0 {
-                timeout(Duration::from_secs(task.timeout_secs), child.wait()).await
-            } else {
-                Ok(child.wait().await)
+            // 3. ペイロードの組み立てとシリアライズ
+            let payload = WorkerTaskPayload {
+                name: task.name.clone(),
+                command: task.command.clone(),
+                timeout_secs: task.timeout_secs,
             };
 
-            // 3. 実行結果の判定とリトライ判定
-            match result {
-                Ok(Ok(status)) => {
-                    if status.success() {
-                        println!("✓ [LocalExecute] ➔ [{}] 正常終了", task.name);
-                        return true; // 成功したら即座に返す
+            let serialized = match serde_json::to_string(&payload) {
+                Ok(json) => json,
+                Err(e) => {
+                    eprintln!("❌ [RemoteExecute] ➔ ペイロードのJSON化に失敗: {:?}", e);
+                    self.release_worker(&worker_addr).await;
+                    return false;
+                }
+            };
+
+            // 4. ワーカーへコマンドデータを送信 (Push)
+            if let Err(e) = stream.write_all(serialized.as_bytes()).await {
+                eprintln!("❌ [RemoteExecute] ➔ ワーカーへのデータ送信失敗: {:?}", e);
+                self.release_worker(&worker_addr).await;
+                continue;
+            }
+            let _ = stream.flush().await;
+
+            // 5. ワーカーからの実行結果の受信待機
+            let mut buffer = vec![0; 65536];
+            let result = match stream.read(&mut buffer).await {
+                Ok(0) => {
+                    eprintln!("❌ [RemoteExecute] ➔ ワーカーが結果を返さずに接続を切断しました。");
+                    false
+                }
+                Ok(n) => {
+                    if let Ok(json_str) = std::str::from_utf8(&buffer[..n]) {
+                        if let Ok(resp) = serde_json::from_str::<WorkerResponse>(json_str) {
+                            if resp.success {
+                                println!("✓ [RemoteExecute] ➔ [{}] ワーカー側で正常終了", task.name);
+                                true
+                            } else {
+                                eprintln!("❌ [RemoteExecute] ➔ [{}] ワーカー側でエラーまたはタイムアウト終了", task.name);
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     } else {
-                        eprintln!("❌ [LocalExecute] ➔ [{}] エラー終了 (Exit Code: {:?})", task.name, status.code());
+                        false
                     }
                 }
-                Ok(Err(e)) => {
-                    eprintln!("❌ [LocalExecute] ➔ [{}] プロセス待機中にエラー発生: {:?}", task.name, e);
+                Err(e) => {
+                    eprintln!("❌ [RemoteExecute] ➔ ワーカーからの結果受信中にエラー発生: {:?}", e);
+                    false
                 }
-                Err(_) => {
-                    eprintln!("⏱️ [LocalExecute] ➔ [{}] タイムアウトしました ({} 秒制限)", task.name, task.timeout_secs);
-                    // タイムアウトした子プロセスを強制終了 (ゾンビ化防止)
-                    let _ = child.kill().await;
-                }
+            };
+
+            // 6. タスク処理が終わったので、ワーカーをプールに返却
+            self.release_worker(&worker_addr).await;
+
+            if result {
+                return true; // 成功したため終了
             }
         }
 
-        // すべての試行が失敗した場合
-        false
+        false // すべてのリトライが失敗
     }
 }
 
 /// 📦 アクター（メインループ）に送るメッセージの定義
 enum Event {
-    /// タスクが完了した通知 (タスク名, 成否)
     TaskFinished(String, bool),
 }
 
-/// 🛡️ Mutex / RwLock を完全に排除した、チャネル駆動型 DagScheduler
+/// 🛡️ チャネル駆動型 DagScheduler
 pub struct DagScheduler {
     tasks: HashMap<String, Task>,
     adjacency_list: HashMap<String, Vec<String>>,
@@ -196,7 +272,7 @@ impl DagScheduler {
         })
     }
 
-    /// 🔄 状態をローカルに閉じ込めた、完全メッセージ駆動のメインループ
+    /// 🔄 完全メッセージ駆動のメインループ
     pub async fn run(self, executor: Arc<dyn Executor>) {
         println!("🚀 [Ninja Engine] --- ロックフリー・チャネル駆動タスクループ開始 ---");
 
@@ -209,7 +285,6 @@ impl DagScheduler {
         let mut ready_queue = VecDeque::from(self.initial_ready_tasks);
 
         loop {
-            // 1. エラーが発生していなければ、Readyなタスクを可能な限りすべてSpawnする
             if !has_failed {
                 while let Some(task_name) = ready_queue.pop_front() {
                     let task = self.tasks.get(&task_name).unwrap().clone();
@@ -225,16 +300,13 @@ impl DagScheduler {
                     });
                 }
             } else {
-                // すでにエラーが検出されている場合は、未実行のReadyキューをクリアしてこれ以上の発火を防ぐ
                 ready_queue.clear();
             }
 
-            // 2. 稼働中のタスクがなく、Readyキューも空なら全グラフ終了
             if running_count == 0 && ready_queue.is_empty() {
                 break;
             }
 
-            // 3. メッセージ待ち受信用アクターコア
             if let Some(event) = event_rx.recv().await {
                 match event {
                     Event::TaskFinished(finished_task, success) => {
@@ -249,8 +321,6 @@ impl DagScheduler {
 
                         statuses.insert(finished_task.clone(), TaskStatus::Done);
 
-                        // 💡 修正ポイント: 既にどこかのタスクで失敗している（has_failed == true）なら、
-                        // 正常終了したタスクがあっても、その後続タスクをQueueに追加しない
                         if !has_failed {
                             if let Some(followers) = self.adjacency_list.get(&finished_task) {
                                 for follower in followers {
@@ -268,7 +338,6 @@ impl DagScheduler {
             }
         }
 
-        // 結果報告
         if has_failed {
             println!("❌ [Ninja Engine] 一部タスクのエラーにより、実行が中断されました。");
         } else {
