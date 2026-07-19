@@ -1,431 +1,232 @@
-// src/core/graph.rs
+#![allow(dead_code)]
 
-use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{timeout, Duration};
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{sleep, Duration};
+use std::net::TcpStream;
+use serde::{Serialize, Deserialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// DAG内の個々のタスクを表す構造体
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
-    pub deps: Vec<String>,
     pub command: String,
+    pub deps: Vec<String>,
     pub timeout_secs: u64,
     pub max_retries: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TaskStatus {
-    Pending,
-    Running,
-    Done,
-    Failed,
+/// ワーカーノードの状態を管理する構造体
+#[derive(Debug, Clone)]
+pub struct WorkerSlot {
+    pub addr: String,
+    pub is_alive: bool,
+    pub is_busy: bool,
 }
 
-#[derive(Debug, PartialEq)]
-pub enum SchedulerError {
-    CycleDetected,
-    UnknownDependency(String),
-}
-
-/// 📦 ワーカーへ送信する各種メッセージの識別子
-#[derive(Serialize, Deserialize)]
-pub enum WorkerMessage {
-    HeartbeatPing,
-    TaskPayload { name: String, command: String, timeout_secs: u64 },
-}
-
-/// 📦 ワーカーから返ってくる各種レスポンスの識別子
-#[derive(Serialize, Deserialize)]
-pub enum WorkerResponse {
-    HeartbeatPong,
-    TaskResult { name: String, success: bool },
-}
-
-/// 🌐 内部でのワーカー状態管理構造体
-struct WorkerSlot {
-    address: String,
-    is_busy: bool,
-    is_alive: bool,
-}
-
-/// 🌐 ネットワーク経由でリモートワーカーに処理を Push する Executor
+/// ネットワーク上の複数ワーカーの調停と、リクエストの割り当てを制御する
 pub struct RemoteExecutor {
-    // スロット管理に生存フラグ（is_alive）を追加
-    workers: Arc<Mutex<Vec<WorkerSlot>>>,
+    pub workers: Arc<Mutex<Vec<WorkerSlot>>>,
+    pub notify_free_worker: Arc<Notify>,
 }
 
 impl RemoteExecutor {
-    pub fn new(worker_addresses: Vec<String>) -> Self {
-        let workers = worker_addresses
+    pub fn new(addresses: Vec<String>) -> Self {
+        let slots = addresses
             .into_iter()
             .map(|addr| WorkerSlot {
-                address: addr,
+                addr,
+                is_alive: true,
                 is_busy: false,
-                is_alive: true, // 初期状態は生存と仮定（ハートビートが即座に更新する）
             })
             .collect();
-        RemoteExecutor {
-            workers: Arc::new(Mutex::new(workers)),
+
+        Self {
+            workers: Arc::new(Mutex::new(slots)),
+            notify_free_worker: Arc::new(Notify::new()),
         }
     }
 
-    /// 空いていて、かつ「生存している」ワーカーを1つ確保する
-    async fn acquire_worker(&self) -> String {
+    pub async fn acquire_worker(&self) -> WorkerSlot {
         loop {
-            let mut workers = self.workers.lock().await;
-            for slot in workers.iter_mut() {
-                if slot.is_alive && !slot.is_busy {
-                    slot.is_busy = true;
-                    return slot.address.clone();
+            let mut slots = self.workers.lock().await;
+            let found_slot = slots.iter_mut().find(|slot| slot.is_alive && !slot.is_busy);
+
+            if let Some(slot) = found_slot {
+                slot.is_busy = true;
+                return slot.clone();
+            }
+
+            drop(slots); 
+            self.notify_free_worker.notified().await;
+        }
+    }
+
+    pub async fn release_worker(&self, addr: String) {
+        let mut slots = self.workers.lock().await;
+        if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+            slot.is_busy = false;
+            println!("🔓 [RemoteExecutor] ワーカー ( {} ) が解放されました。", addr);
+            self.notify_free_worker.notify_one();
+        }
+    }
+
+    pub async fn update_node_quality(&self, addr: &str, is_alive: bool) {
+        let mut slots = self.workers.lock().await;
+        if let Some(slot) = slots.iter_mut().find(|s| s.addr == addr) {
+            if slot.is_alive != is_alive {
+                slot.is_alive = is_alive;
+                if is_alive {
+                    println!("💖 [RemoteExecutor] ワーカー ( {} ) の復帰を確認しました。", addr);
+                } else {
+                    println!("🔴 [RemoteExecutor] ワーカー ( {} ) の品質低下（ダウン）を検知しました。", addr);
                 }
-            }
-            drop(workers);
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// 使い終わったワーカーを解放する
-    async fn release_worker(&self, target_addr: &str) {
-        let mut workers = self.workers.lock().await;
-        for slot in workers.iter_mut() {
-            if slot.address == target_addr {
-                slot.is_busy = false;
-                break;
+                self.notify_free_worker.notify_waiters();
             }
         }
     }
 
-    /// 💓 バックグラウンドで常時回り続けるハートビート監視ループ
-    pub async fn start_heartbeat_loop(self: Arc<Self>, interval: Duration, check_timeout: Duration) {
-        println!("💓 [Heartbeat] 死活監視アクターを起動しました (間隔: {:?})", interval);
-        
-        loop {
-            tokio::time::sleep(interval).await;
-            let mut workers = self.workers.lock().await;
-            
-            for slot in workers.iter_mut() {
-                let addr = slot.address.clone();
-                
-                // 非同期に各ワーカーへ Ping を打つ
-                let is_now_alive = match timeout(check_timeout, TcpStream::connect(&addr)).await {
-                    Ok(Ok(mut stream)) => {
-                        let ping = match serde_json::to_string(&WorkerMessage::HeartbeatPing) {
-                            Ok(j) => j,
-                            Err(_) => { slot.is_alive = false; continue; }
-                        };
-                        
-                        if stream.write_all(ping.as_bytes()).await.is_err() {
-                            false
+    pub async fn start_heartbeat_loop(&self, interval: Duration, timeout: Duration) {
+        let workers_clone = Arc::clone(&self.workers);
+        let notify_clone = Arc::clone(&self.notify_free_worker);
+
+        tokio::spawn(async move {
+            loop {
+                sleep(interval).await;
+                let mut slots = workers_clone.lock().await;
+
+                for slot in slots.iter_mut() {
+                    let alive = match TcpStream::connect_timeout(
+                        &slot.addr.parse().unwrap(),
+                        timeout,
+                    ) {
+                        Ok(_) => true,
+                        Err(_) => false,
+                    };
+
+                    if slot.is_alive != alive {
+                        slot.is_alive = alive;
+                        if alive {
+                            println!("💖 [Heartbeat] ワーカーノード ( {} ) が復帰しました。", slot.addr);
                         } else {
-                            let mut buffer = vec![0; 1024];
-                            match stream.read(&mut buffer).await {
-                                Ok(n) if n > 0 => {
-                                    if let Ok(json_str) = std::str::from_utf8(&buffer[..n]) {
-                                        matches!(serde_json::from_str::<WorkerResponse>(json_str), Ok(WorkerResponse::HeartbeatPong))
-                                    } else {
-                                        false
-                                    }
-                                }
-                                _ => false,
-                            }
+                            println!("🔴 [Heartbeat] ワーカーノード ( {} ) の切断・ハングアップを検知しました！", slot.addr);
                         }
+                        notify_clone.notify_waiters();
                     }
-                    _ => false, // 接続失敗、またはタイムアウト
-                };
-
-                // 状態変化があった場合のみログ出力
-                if slot.is_alive != is_now_alive {
-                    if is_now_alive {
-                        println!("🟢 [Heartbeat] ワーカーノード ( {} ) の復帰を確認しました。", addr);
-                    } else {
-                        println!("🔴 [Heartbeat] ワーカーノード ( {} ) の切断・ハングアップを検知しました！", addr);
-                    }
-                    slot.is_alive = is_now_alive;
                 }
             }
-        }
+        });
     }
 }
 
-#[async_trait::async_trait]
-pub trait Executor: Send + Sync {
-    async fn execute(&self, task: &Task) -> bool;
-}
-
-#[async_trait::async_trait]
-impl Executor for RemoteExecutor {
-    async fn execute(&self, task: &Task) -> bool {
-        let mut attempts = 0;
-        let max_attempts = task.max_retries + 1;
-
-        while attempts < max_attempts {
-            attempts += 1;
-            if attempts > 1 {
-                println!("🔄 [RemoteExecute] ➔ [{}] リトライを開始します ({}/{})", task.name, attempts - 1, task.max_retries);
-            }
-
-            let worker_addr = self.acquire_worker().await;
-            println!("🚀 [RemoteExecute] ➔ [{}] ワーカー( {} ) を割り当てました。タスクを Push 送信します...", task.name, worker_addr);
-
-            let mut stream = match TcpStream::connect(&worker_addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("❌ [RemoteExecute] ➔ ワーカー( {} ) への接続に失敗しました: {:?}", worker_addr, e);
-                    self.release_worker(&worker_addr).await;
-                    continue; 
-                }
-            };
-
-            let message = WorkerMessage::TaskPayload {
-                name: task.name.clone(),
-                command: task.command.clone(),
-                timeout_secs: task.timeout_secs,
-            };
-
-            let serialized = match serde_json::to_string(&message) {
-                Ok(json) => json,
-                Err(e) => {
-                    eprintln!("❌ [RemoteExecute] ➔ ペイロードのJSON化に失敗: {:?}", e);
-                    self.release_worker(&worker_addr).await;
-                    return false;
-                }
-            };
-
-            if let Err(e) = stream.write_all(serialized.as_bytes()).await {
-                eprintln!("❌ [RemoteExecute] ➔ ワーカーへのデータ送信失敗: {:?}", e);
-                self.release_worker(&worker_addr).await;
-                continue;
-            }
-            let _ = stream.flush().await;
-
-            let mut buffer = vec![0; 65536];
-            let result = match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    eprintln!("❌ [RemoteExecute] ➔ ワーカーが結果を返さずに接続を切断しました。");
-                    false
-                }
-                Ok(n) => {
-                    if let Ok(json_str) = std::str::from_utf8(&buffer[..n]) {
-                        match serde_json::from_str::<WorkerResponse>(json_str) {
-                            Ok(WorkerResponse::TaskResult { success, .. }) => {
-                                if success {
-                                    println!("✓ [RemoteExecute] ➔ [{}] ワーカー側で正常終了", task.name);
-                                    true
-                                } else {
-                                    eprintln!("❌ [RemoteExecute] ➔ [{}] ワーカー側でエラーまたはタイムアウト終了", task.name);
-                                    false
-                                }
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                }
-                Err(e) => {
-                    eprintln!("❌ [RemoteExecute] ➔ ワーカーからの結果受信中にエラー発生: {:?}", e);
-                    false
-                }
-            };
-
-            self.release_worker(&worker_addr).await;
-
-            if result {
-                return true; 
-            }
-        }
-
-        false 
-    }
-}
-
-enum Event {
-    TaskFinished(String, bool),
-}
-
+/// DAG全体の依存関係を解決しながらタスク実行をコントロールするスケジューラ
 pub struct DagScheduler {
-    tasks: HashMap<String, Task>,
-    adjacency_list: HashMap<String, Vec<String>>,
-    initial_indegrees: HashMap<String, usize>,
-    initial_statuses: HashMap<String, TaskStatus>,
-    initial_ready_tasks: Vec<String>,
+    pub tasks: HashMap<String, Task>,
+    pub adjacency_list: HashMap<String, Vec<String>>,
+    pub in_degree: HashMap<String, usize>,
 }
 
 impl DagScheduler {
-    pub fn new(received_tasks: Vec<Task>) -> Result<Self, SchedulerError> {
-        let mut tasks = HashMap::new();
-        let mut base_indegrees = HashMap::new();
-        let mut adjacency_list = HashMap::new();
-        let mut statuses = HashMap::new();
+    pub fn new(tasks: Vec<Task>) -> Result<Self, String> {
+        let mut adj = HashMap::new();
+        let mut in_deg = HashMap::new();
+        let mut task_map = HashMap::new();
 
-        for task in &received_tasks {
-            let name = task.name.clone();
-            base_indegrees.insert(name.clone(), 0);
-            adjacency_list.insert(name.clone(), Vec::new());
-            statuses.insert(name.clone(), TaskStatus::Pending);
-            tasks.insert(name, task.clone());
+        for task in &tasks {
+            adj.insert(task.name.clone(), Vec::new());
+            in_deg.insert(task.name.clone(), 0);
+            task_map.insert(task.name.clone(), task.clone());
         }
 
-        for task in &received_tasks {
+        for task in &tasks {
             for dep in &task.deps {
-                if !tasks.contains_key(dep) {
-                    return Err(SchedulerError::UnknownDependency(dep.clone()));
+                if !task_map.contains_key(dep) {
+                    return Err(format!("タスク '{}' が依存している '{}' が見つかりません。", task.name, dep));
                 }
-                if let Some(list) = adjacency_list.get_mut(dep) {
-                    list.push(task.name.clone());
-                }
-                if let Some(deg) = base_indegrees.get_mut(&task.name) {
-                    *deg += 1;
-                }
+                adj.entry(dep.clone()).or_insert_with(Vec::new).push(task.name.clone());
+                *in_deg.entry(task.name.clone()).or_insert(0) += 1;
             }
         }
 
-        let mut temp_indegrees = base_indegrees.clone();
-        let mut validation_queue = VecDeque::new();
-        for (name, &deg) in &temp_indegrees {
-            if deg == 0 {
-                validation_queue.push_back(name.clone());
-            }
-        }
-
-        let mut sorted_count = 0;
-        let mut initial_ready_tasks = Vec::new();
-        while let Some(u) = validation_queue.pop_front() {
-            sorted_count += 1;
-            if *temp_indegrees.get(&u).unwrap() == 0 {
-                if *base_indegrees.get(&u).unwrap() == 0 {
-                    initial_ready_tasks.push(u.clone());
-                }
-            }
-            if let Some(followers) = adjacency_list.get(&u) {
-                for follower in followers {
-                    if let Some(deg) = temp_indegrees.get_mut(follower) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            validation_queue.push_back(follower.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        if sorted_count != received_tasks.len() {
-            return Err(SchedulerError::CycleDetected);
-        }
-
-        Ok(DagScheduler {
-            tasks,
-            adjacency_list,
-            initial_indegrees: base_indegrees,
-            initial_statuses: statuses,
-            initial_ready_tasks,
+        Ok(Self {
+            tasks: task_map,
+            adjacency_list: adj,
+            in_degree: in_deg,
         })
     }
 
-    pub async fn run(self, executor: Arc<dyn Executor>) {
-        println!("🚀 [Ninja Engine] --- ロックフリー・チャネル駆動タスクループ開始 ---");
+    pub fn get_ready_tasks(&self, completed: &HashSet<String>, running: &HashSet<String>) -> Vec<String> {
+        let mut ready = Vec::new();
+        for (task_id, &_deg) in &self.in_degree {
+            if completed.contains(task_id) || running.contains(task_id) {
+                continue;
+            }
+            let deps = &self.tasks[task_id].deps;
+            if deps.iter().all(|d| completed.contains(d)) {
+                ready.push(task_id.clone());
+            }
+        }
+        ready
+    }
 
-        let mut indegrees = self.initial_indegrees;
-        let mut statuses = self.initial_statuses;
-        let mut running_count = 0;
-        let mut has_failed = false;
+    pub async fn run(&mut self, executor: Arc<RemoteExecutor>) {
+        let completed = Arc::new(Mutex::new(HashSet::new()));
+        let running = Arc::new(Mutex::new(HashSet::new()));
+        let notify_task_complete = Arc::new(Notify::new());
+        let total_tasks = self.tasks.len();
 
-        let (event_tx, mut event_rx) = mpsc::channel::<Event>(1024);
-        let mut ready_queue = VecDeque::from(self.initial_ready_tasks);
+        println!("🚀 [DagScheduler] DAGの実行を開始します。総タスク数: {}", total_tasks);
 
         loop {
-            if !has_failed {
-                while let Some(task_name) = ready_queue.pop_front() {
-                    let task = self.tasks.get(&task_name).unwrap().clone();
-                    let event_tx_clone = event_tx.clone();
-                    let exec_clone = Arc::clone(&executor);
+            let completed_guard = completed.lock().await;
+            let running_guard = running.lock().await;
 
-                    statuses.insert(task_name.clone(), TaskStatus::Running);
-                    running_count += 1;
-
-                    tokio::spawn(async move {
-                        let success = exec_clone.execute(&task).await;
-                        let _ = event_tx_clone.send(Event::TaskFinished(task.name, success)).await;
-                    });
-                }
-            } else {
-                ready_queue.clear();
-            }
-
-            if running_count == 0 && ready_queue.is_empty() {
+            if completed_guard.len() == total_tasks {
+                println!("🏁 [DagScheduler] すべてのタスクが正常に完了しました！");
                 break;
             }
 
-            if let Some(event) = event_rx.recv().await {
-                match event {
-                    Event::TaskFinished(finished_task, success) => {
-                        running_count -= 1;
+            let ready_tasks = self.get_ready_tasks(&completed_guard, &running_guard);
 
-                        if !success {
-                            has_failed = true;
-                            statuses.insert(finished_task.clone(), TaskStatus::Failed);
-                            println!("❌ [Ninja Engine] タスク [{}] が最終的に失敗しました。新規の発火を完全に停止します。", finished_task);
-                            continue;
-                        }
+            drop(completed_guard);
+            drop(running_guard);
 
-                        statuses.insert(finished_task.clone(), TaskStatus::Done);
-
-                        if !has_failed {
-                            if let Some(followers) = self.adjacency_list.get(&finished_task) {
-                                for follower in followers {
-                                    if let Some(deg) = indegrees.get_mut(follower) {
-                                        *deg -= 1;
-                                        if *deg == 0 {
-                                            ready_queue.push_back(follower.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if ready_tasks.is_empty() {
+                notify_task_complete.notified().await;
+                continue;
             }
-        }
 
-        if has_failed {
-            println!("❌ [Ninja Engine] 一部タスクのエラーにより、実行が中断されました。");
-        } else {
-            println!("🎉 [Ninja Engine] 全てのタスクグラフが依存関係通りに完全実行されました。\n");
-        }
-    }
-}
+            for task_name in ready_tasks {
+                let task = self.tasks.get(&task_name).unwrap().clone();
+                let executor_clone = Arc::clone(&executor);
+                let completed_clone = Arc::clone(&completed);
+                let running_clone = Arc::clone(&running);
+                let notify_clone = Arc::clone(&notify_task_complete);
 
-pub fn resolve_execution_order(tasks: &[Task]) -> Result<Vec<String>, String> {
-    let mut indegree = HashMap::new();
-    let mut adj = HashMap::new();
-    for task in tasks {
-        indegree.insert(task.name.clone(), 0);
-        adj.insert(task.name.clone(), Vec::new());
-    }
-    for task in tasks {
-        for dep in &task.deps {
-            if !indegree.contains_key(dep) { return Err(format!("Unknown dependency: {}", dep)); }
-            if let Some(list) = adj.get_mut(dep) { list.push(task.name.clone()); }
-            if let Some(count) = indegree.get_mut(&task.name) { *count += 1; }
-        }
-    }
-    let mut queue = VecDeque::new();
-    for (name, &count) in &indegree { if count == 0 { queue.push_back(name.clone()); } }
-    let mut order = Vec::new();
-    while let Some(u) = queue.pop_front() {
-        order.push(u.clone());
-        if let Some(neighbors) = adj.get(&u) {
-            for v in neighbors {
-                if let Some(count) = indegree.get_mut(v) {
-                    *count -= 1;
-                    if *count == 0 { queue.push_back(v.clone()); }
-                }
+                running.lock().await.insert(task_name.clone());
+
+                tokio::spawn(async move {
+                    println!("⏳ [DagScheduler] タスク '{}' のワーカーを確保中...", task.name);
+                    let worker = executor_clone.acquire_worker().await;
+                    println!("🎯 [DagScheduler] ワーカー ( {} ) を確保。タスク '{}' を割り当てます。", worker.addr, task.command);
+
+                    // --- [擬似的なタスク実行処理] ---
+                    tokio::time::sleep(Duration::from_secs(2)).await; 
+                    // ---------------------------------
+
+                    executor_clone.release_worker(worker.addr).await;
+
+                    let mut r_guard = running_clone.lock().await;
+                    r_guard.remove(&task.name);
+                    
+                    let mut c_guard = completed_clone.lock().await;
+                    c_guard.insert(task.name.clone());
+
+                    println!("✅ [DagScheduler] タスク '{}' が完了しました。", task.name);
+                    notify_clone.notify_one();
+                });
             }
         }
     }
-    if order.len() == tasks.len() { Ok(order) } else { Err("Cycle detected or unresolved dependency".to_string()) }
 }

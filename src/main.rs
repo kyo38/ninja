@@ -1,119 +1,97 @@
-// src/main.rs
-
 use std::sync::Arc;
-use std::fs;
-use serde::Deserialize;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::AsyncReadExt;
 use tokio::time::Duration;
-use ninja::core::graph::{DagScheduler, RemoteExecutor, Task};
+use tokio::net::TcpListener;
+use tokio::io::AsyncReadExt;
 
-/// 📋 config.toml を読み込むための構造体定義
-#[derive(Deserialize)]
-struct Config {
-    worker_addresses: Vec<String>,
-    heartbeat: HeartbeatConfig,
-}
+mod core;
+use crate::core::graph::{DagScheduler, RemoteExecutor, Task};
 
-#[derive(Deserialize)]
-struct HeartbeatConfig {
-    interval_secs: u64,
-    timeout_secs: u64,
-}
+/// テスト用のダミーワーカーノードを起動する関数
+async fn spawn_dummy_worker(addr: &'static str) {
+    let listener = TcpListener::bind(addr).await.unwrap();
+    println!("📡 [Dummy Worker] {} でリクエスト待機中...", addr);
 
-/// 🔌 各クライアントからのTCP接続を処理する非同期関数
-async fn handle_client(mut stream: TcpStream, executor: Arc<RemoteExecutor>) {
-    let mut buffer = vec![0; 65536];
-
-    println!("📥 [Ninja Manager] クライアントからのデータを受信中...");
-
-    match stream.read(&mut buffer).await {
-        Ok(0) => {
-            println!("⚠️ [Ninja Manager] クライアントがデータを送らずに接続を閉じました。");
-        }
-        Ok(n) => {
-            println!("📦 [Ninja Manager] {} バイトのデータを受信。シリアライズ解析を開始します...", n);
-            
-            let json_str = match std::str::from_utf8(&buffer[..n]) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("❌ [Ninja Manager] UTF-8 デコードエラー: {:?}", e);
-                    return;
-                }
-            };
-
-            match serde_json::from_str::<Vec<Task>>(json_str) {
-                Ok(tasks) => {
-                    println!("✓ [Ninja Manager] タスクグラフのデシリアライズに成功しました (タスク数: {})", tasks.len());
-                    
-                    match DagScheduler::new(tasks) {
-                        Ok(scheduler) => {
-                            println!("🚀 [Ninja Manager] グラフ整合性チェック通過。アクターメインループを起動します。");
-                            scheduler.run(executor).await;
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut socket, _client_addr)) => {
+                    let mut buf = [0; 1024];
+                    tokio::spawn(async move {
+                        while let Ok(n) = socket.read(&mut buf).await {
+                            if n == 0 { break; }
                         }
-                        Err(e) => {
-                            eprintln!("❌ [Ninja Manager] スケジューラの初期化またはサイクル検出に失敗しました: {:?}", e);
-                        }
-                    }
+                    });
                 }
-                Err(e) => {
-                    eprintln!("❌ [Ninja Manager] JSONのデシリアライズに失敗しました: {:?}", e);
-                    eprintln!("📄 受信データ内容: {}", json_str);
-                }
+                Err(_) => break,
             }
         }
-        Err(e) => {
-            eprintln!("❌ [Ninja Manager] ストリーム読み込み中にエラーが発生しました: {:?}", e);
-        }
-    }
+    });
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Ninja Distributed DAG Engine (Manager Mode) ===");
+async fn main() {
+    println!("🥷 [Ninja] 分散タスクスケジューラを起動しています...");
 
-    // 💡 1. config.toml から設定を動的にパース（ハードコーディングの排除）
-    println!("📖 [Ninja Manager] 設定ファイル (config.toml) を読み込んでいます...");
-    let config_content = fs::read_to_string("config.toml")
-        .expect("❌ config.toml の読み込みに失敗しました。プロジェクトのルートに配置してください。");
-    let config: Config = toml::from_str(&config_content)
-        .expect("❌ config.toml の構文パースに失敗しました。");
+    // 1. ローカルホスト上にダミーのワーカーノードを2つバックグラウンドで起動
+    spawn_dummy_worker("127.0.0.1:8081").await;
+    spawn_dummy_worker("127.0.0.1:8082").await;
 
-    println!("✓ [Ninja Manager] 設定のロード完了。登録ワーカー数: {}", config.worker_addresses.len());
+    // サーバーの起動を確実にするため少し待つ
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // リモート接続対応の Executor を初期化
-    let executor = Arc::new(RemoteExecutor::new(config.worker_addresses));
-    
-    // 💡 2. バックグラウンドでハートビート（死活監視）アクターを常時起動
-    let hb_executor = Arc::clone(&executor);
-    let interval = Duration::from_secs(config.heartbeat.interval_secs);
-    let timeout_secs = Duration::from_secs(config.heartbeat.timeout_secs);
-    
-    tokio::spawn(async move {
-        hb_executor.start_heartbeat_loop(interval, timeout_secs).await;
-    });
+    // 2. ダミーのタスクセット（DAG）を構築
+    let tasks = vec![
+        Task {
+            name: "task_A".to_string(),
+            command: "echo 'Executing Task A'".to_string(),
+            deps: vec![],
+            timeout_secs: 30,
+            max_retries: 3,
+        },
+        Task {
+            name: "task_B".to_string(),
+            command: "echo 'Executing Task B'".to_string(),
+            deps: vec!["task_A".to_string()],
+            timeout_secs: 30,
+            max_retries: 3,
+        },
+        Task {
+            name: "task_C".to_string(),
+            command: "echo 'Executing Task C'".to_string(),
+            deps: vec!["task_A".to_string()],
+            timeout_secs: 60,
+            max_retries: 1,
+        },
+        Task {
+            name: "task_D".to_string(),
+            command: "echo 'Executing Task D'".to_string(),
+            deps: vec!["task_B".to_string(), "task_C".to_string()],
+            timeout_secs: 10,
+            max_retries: 5,
+        },
+    ];
 
-    // クライアントからの要求を受け付ける待ち受けポート（8080）
-    let addr = "127.0.0.1:8080";
-    let listener = TcpListener::bind(addr).await?;
-    println!("📡 [Ninja Manager] マネージャーが起動しました。接続を待機しています: {}", addr);
+    // 3. リモートエグゼキュータ（ワーカー管理）の初期化
+    let worker_addresses = vec![
+        "127.0.0.1:8081".to_string(),
+        "127.0.0.1:8082".to_string(),
+    ];
+    let executor = Arc::new(RemoteExecutor::new(worker_addresses));
 
-    // サーバーメインループ
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                println!("🤝 [Ninja Manager] 新しいクライアントが接続しました: {}", client_addr);
-                
-                let exec_clone = Arc::clone(&executor);
-                
-                tokio::spawn(async move {
-                    handle_client(stream, exec_clone).await;
-                    println!("🔌 [Ninja Manager] クライアント ( {} ) との通信処理が終了しました。\n", client_addr);
-                });
-            }
-            Err(e) => {
-                eprintln!("❌ [Ninja Manager] 接続受け入れエラー: {:?}", e);
-            }
+    // 4. ハートビーループの開始 (2秒間隔、タイムアウト500ms)
+    executor.start_heartbeat_loop(Duration::from_secs(2), Duration::from_millis(500)).await;
+
+    // 5. スケジューラの初期化と実行
+    match DagScheduler::new(tasks) {
+        Ok(mut scheduler) => {
+            println!("✅ [Main] DAG構造の解析に成功しました。実行ループへ移行します。");
+            scheduler.run(executor).await;
+        }
+        Err(err) => {
+            eprintln!("❌ [Main] スケジューラの初期化に失敗しました: {}", err);
         }
     }
+
+    // 完了後のハートビートを確認するため少し待って終了
+    tokio::time::sleep(Duration::from_secs(2)).await;
 }

@@ -1,81 +1,76 @@
-use anyhow::{Result, bail};
+#![allow(dead_code)]
+#![allow(unused_imports)]
 
-/// 各中継ノード（ホップ）が参照する経路情報
+use std::io::{Result, Error, ErrorKind};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HopField {
-    pub as_id: u32,       // 自律システム(AS)番号
-    pub egress_if: u16,   // 出力インターフェース番号
-    pub mac: [u8; 4],     // 経路の正当性を証明する簡易MAC
+    pub node_id: u32,
+    pub latency_ms: u16,
 }
 
-/// パケットに含まれる経路情報全体を管理する構造体
 #[derive(Debug, Clone)]
 pub struct PathHeader {
-    pub current_hop_index: u8, // 現在どこのホップにいるかを示すポインタ
-    pub hops: Vec<HopField>,   // 経由するホップのリスト
+    pub hops: Vec<HopField>,
+    pub current_index: usize,
 }
 
 impl PathHeader {
     pub fn new(hops: Vec<HopField>) -> Self {
         Self {
-            current_hop_index: 0,
             hops,
+            current_index: 0,
         }
     }
 
-    /// バイナリへのシリアライズ
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(self.current_hop_index);
-        buf.push(self.hops.len() as u8);
+        let mut bytes = Vec::new();
+        bytes.push(self.hops.len() as u8);
+        bytes.push(self.current_index as u8);
 
         for hop in &self.hops {
-            buf.extend_from_slice(&hop.as_id.to_be_bytes());
-            buf.extend_from_slice(&hop.egress_if.to_be_bytes());
-            buf.extend_from_slice(&hop.mac);
+            bytes.extend(&hop.node_id.to_be_bytes());
+            bytes.extend(&hop.latency_ms.to_be_bytes());
         }
-        buf
+        bytes
     }
 
-    /// バイナリからのパース
     pub fn from_bytes(data: &[u8]) -> Result<(Self, usize)> {
         if data.len() < 2 {
-            bail!("Path header too short");
+            return Err(Error::new(ErrorKind::UnexpectedEof, "ヘッダーの長さが足りません"));
         }
-        let current_hop_index = data[0];
-        let hop_count = data[1] as usize;
-        
-        let expected_len = 2 + (hop_count * 10); // 1ホップあたり 4 + 2 + 4 = 10バイト
+
+        let hop_count = data[0] as usize;
+        let current_index = data[1] as usize;
+        let expected_len = 2 + (hop_count * 6);
+
         if data.len() < expected_len {
-            bail!("Invalid path header length");
+            return Err(Error::new(ErrorKind::UnexpectedEof, "パスデータが不完全です"));
         }
 
         let mut hops = Vec::with_capacity(hop_count);
-        let mut offset = 2;
+        let mut pos = 2;
 
         for _ in 0..hop_count {
-            let as_id = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-            let egress_if = u16::from_be_bytes([data[offset+4], data[offset+5]]);
-            let mut mac = [0u8; 4];
-            
-            mac.copy_from_slice(&data[offset+6..offset+10]);
-
-            hops.push(HopField { as_id, egress_if, mac });
-            offset += 10;
+            let node_id = u32::from_be_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+            let latency_ms = u16::from_be_bytes([data[pos+4], data[pos+5]]);
+            hops.push(HopField { node_id, latency_ms });
+            pos += 6;
         }
 
-        Ok((Self { current_hop_index, hops }, offset))
+        Ok((Self { hops, current_index }, pos))
     }
 
-    /// 現在のホップ情報を取得
     pub fn current_hop(&self) -> Option<&HopField> {
-        self.hops.get(self.current_hop_index as usize)
+        self.hops.get(self.current_index)
     }
 
-    /// 次のホップへ進める（すべてのホップを消化して最終目的地を越えたら true を返す）
     pub fn increment_hop(&mut self) -> bool {
-        self.current_hop_index += 1;
-        // 進めた結果、インデックスがホップ数と同じ（これ以上ホップがない）なら最終目的地に到達したとみなす
-        self.current_hop_index as usize >= self.hops.len()
+        if self.current_index + 1 < self.hops.len() {
+            self.current_index += 1;
+            true
+        } else {
+            false
+        }
     }
 }
