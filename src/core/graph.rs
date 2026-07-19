@@ -4,12 +4,16 @@ use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub name: String,
     pub deps: Vec<String>,
     pub command: String,
+    pub timeout_secs: u64,    // ⏱️ タイムアウト秒数（0なら無制限）
+    pub max_retries: usize,   // 🔄 最大リトライ回数（0ならリトライなし）
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37,9 +41,71 @@ pub struct LocalExecutor;
 #[async_trait::async_trait]
 impl Executor for LocalExecutor {
     async fn execute(&self, task: &Task) -> bool {
-        println!("  ⚡ [LocalExecute] ➔ [{}] Running: {}", task.name, task.command);
-        tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
-        true
+        let mut attempts = 0;
+        let max_attempts = task.max_retries + 1;
+
+        while attempts < max_attempts {
+            attempts += 1;
+            if attempts > 1 {
+                println!("🔄 [LocalExecute] ➔ [{}] リトライを開始します ({}/{})", task.name, attempts - 1, task.max_retries);
+            }
+
+            println!(" ⚡ [LocalExecute] ➔ [{}] Running: {}", task.name, task.command);
+
+            // 🛠️ Windows/Linux両対応のコマンド実行ロジック
+            let mut cmd = if cfg!(target_os = "windows") {
+                let mut c = Command::new("cmd");
+                c.args(["/C", &task.command]);
+                c
+            } else {
+                let mut c = Command::new("sh");
+                c.args(["-c", &task.command]);
+                c
+            };
+
+            // 標準出力と標準エラーをキャプチャ（バックグラウンドで非同期にパイプ処理）
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            // 1. プロセスの生成
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("❌ [LocalExecute] ➔ [{}] プロセスの起動に失敗: {:?}", task.name, e);
+                    continue; // リトライへ
+                }
+            };
+
+            // 2. タイムアウト付きでプロセスの終了を待機
+            let result = if task.timeout_secs > 0 {
+                timeout(Duration::from_secs(task.timeout_secs), child.wait()).await
+            } else {
+                Ok(child.wait().await)
+            };
+
+            // 3. 実行結果の判定とリトライ判定
+            match result {
+                Ok(Ok(status)) => {
+                    if status.success() {
+                        println!("✓ [LocalExecute] ➔ [{}] 正常終了", task.name);
+                        return true; // 成功したら即座に返す
+                    } else {
+                        eprintln!("❌ [LocalExecute] ➔ [{}] エラー終了 (Exit Code: {:?})", task.name, status.code());
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("❌ [LocalExecute] ➔ [{}] プロセス待機中にエラー発生: {:?}", task.name, e);
+                }
+                Err(_) => {
+                    eprintln!("⏱️ [LocalExecute] ➔ [{}] タイムアウトしました ({} 秒制限)", task.name, task.timeout_secs);
+                    // タイムアウトした子プロセスを強制終了 (ゾンビ化防止)
+                    let _ = child.kill().await;
+                }
+            }
+        }
+
+        // すべての試行が失敗した場合
+        false
     }
 }
 
@@ -53,12 +119,8 @@ enum Event {
 pub struct DagScheduler {
     tasks: HashMap<String, Task>,
     adjacency_list: HashMap<String, Vec<String>>,
-    
-    // 初期状態の入次数とステータス（不変データとして保持）
     initial_indegrees: HashMap<String, usize>,
     initial_statuses: HashMap<String, TaskStatus>,
-    
-    // 実行時にReadyになったタスクを投入する初期キュー
     initial_ready_tasks: Vec<String>,
 }
 
@@ -105,7 +167,6 @@ impl DagScheduler {
         while let Some(u) = validation_queue.pop_front() {
             sorted_count += 1;
             if *temp_indegrees.get(&u).unwrap() == 0 {
-                // 実際に初期状態で依存ゼロのタスクを収集
                 if *base_indegrees.get(&u).unwrap() == 0 {
                     initial_ready_tasks.push(u.clone());
                 }
@@ -139,16 +200,12 @@ impl DagScheduler {
     pub async fn run(self, executor: Arc<dyn Executor>) {
         println!("🚀 [Ninja Engine] --- ロックフリー・チャネル駆動タスクループ開始 ---");
 
-        // 📝 状態（State）はすべてこの関数内のローカル変数として管理。ロックは一切不要
         let mut indegrees = self.initial_indegrees;
         let mut statuses = self.initial_statuses;
         let mut running_count = 0;
         let mut has_failed = false;
 
-        // タスク完了イベントを集約するメインチャネル
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(1024);
-        
-        // 実行可能（Ready）になったタスクを管理する内部キュー
         let mut ready_queue = VecDeque::from(self.initial_ready_tasks);
 
         loop {
@@ -162,12 +219,14 @@ impl DagScheduler {
                     statuses.insert(task_name.clone(), TaskStatus::Running);
                     running_count += 1;
 
-                    // バックグラウンドで非同期実行。終わったらチャネルにイベントを投げるだけ
                     tokio::spawn(async move {
                         let success = exec_clone.execute(&task).await;
                         let _ = event_tx_clone.send(Event::TaskFinished(task.name, success)).await;
                     });
                 }
+            } else {
+                // すでにエラーが検出されている場合は、未実行のReadyキューをクリアしてこれ以上の発火を防ぐ
+                ready_queue.clear();
             }
 
             // 2. 稼働中のタスクがなく、Readyキューも空なら全グラフ終了
@@ -176,7 +235,6 @@ impl DagScheduler {
             }
 
             // 3. メッセージ待ち受信用アクターコア
-            // ロックを一切取らず、チャネルから流れてくるイベントのみで状態を安全に更新
             if let Some(event) = event_rx.recv().await {
                 match event {
                     Event::TaskFinished(finished_task, success) => {
@@ -185,19 +243,22 @@ impl DagScheduler {
                         if !success {
                             has_failed = true;
                             statuses.insert(finished_task.clone(), TaskStatus::Failed);
-                            println!("❌ [Ninja Engine] タスク [{}] が失敗しました。後続の発火を停止します。", finished_task);
+                            println!("❌ [Ninja Engine] タスク [{}] が最終的に失敗しました。新規の発火を完全に停止します。", finished_task);
                             continue;
                         }
 
                         statuses.insert(finished_task.clone(), TaskStatus::Done);
 
-                        // 後続タスクの依存度（入次数）を下げる
-                        if let Some(followers) = self.adjacency_list.get(&finished_task) {
-                            for follower in followers {
-                                if let Some(deg) = indegrees.get_mut(follower) {
-                                    *deg -= 1;
-                                    if *deg == 0 {
-                                        ready_queue.push_back(follower.clone());
+                        // 💡 修正ポイント: 既にどこかのタスクで失敗している（has_failed == true）なら、
+                        // 正常終了したタスクがあっても、その後続タスクをQueueに追加しない
+                        if !has_failed {
+                            if let Some(followers) = self.adjacency_list.get(&finished_task) {
+                                for follower in followers {
+                                    if let Some(deg) = indegrees.get_mut(follower) {
+                                        *deg -= 1;
+                                        if *deg == 0 {
+                                            ready_queue.push_back(follower.clone());
+                                        }
                                     }
                                 }
                             }
