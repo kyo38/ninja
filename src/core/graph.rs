@@ -6,9 +6,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
 
-use crate::core::executor::Executor;
+use crate::core::executor::{Executor, TaskResult}; // ✨ TaskResult をインポート
 use crate::core::worker::WorkerRegistry;
-use crate::core::path::PathStrategy; // ✨ PathStrategy トレイトをインポート
+use crate::core::path::PathStrategy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -68,14 +68,11 @@ impl DagScheduler {
         ready
     }
 
-    // 🔴 修正点: インラインにあった `select_best_worker` メソッドを完全に削除しました。
-
-    /// ✨ 修正: 引数に `Arc<dyn PathStrategy>` を追加し、パス決定を動的に外部委ねできるように統合
     pub async fn run(
         &mut self, 
         executor: Arc<dyn Executor>, 
         registry: WorkerRegistry,
-        strategy: Arc<dyn PathStrategy>, // ✨ 戦略オブジェクトを受け取る
+        strategy: Arc<dyn PathStrategy>,
     ) {
         let completed = Arc::new(Mutex::new(HashSet::new()));
         let running = Arc::new(Mutex::new(HashSet::new()));
@@ -109,7 +106,7 @@ impl DagScheduler {
                 
                 let executor_clone = Arc::clone(&executor);
                 let registry_clone = registry.clone();
-                let strategy_clone = Arc::clone(&strategy); // ✨ スレッド用に戦略をクローン
+                let strategy_clone = Arc::clone(&strategy);
                 let completed_clone = Arc::clone(&completed);
                 let running_clone = Arc::clone(&running);
                 let notify_clone = Arc::clone(&notify_loop_event);
@@ -121,7 +118,6 @@ impl DagScheduler {
                     let mut success = false;
 
                     loop {
-                        // ✨ 修正: 注入された戦略オブジェクトの `select_path` を呼び出して統合
                         let target_worker_res = {
                             let workers = registry_clone.get_cloned_sessions().await;
                             strategy_clone.select_path(&workers)
@@ -146,26 +142,44 @@ impl DagScheduler {
                         let timeout_duration = Duration::from_secs(task.timeout_secs);
                         let exec_future = executor_clone.submit(task.clone(), target_address.clone());
 
+                        // ✨ 🥇 TaskResult に応じたインテリジェントなハンドリング
                         match tokio::time::timeout(timeout_duration, exec_future).await {
-                            Ok(Ok(_)) => {
-                                success = true;
-                                break;
+                            Ok(Ok(task_result)) => {
+                                match task_result {
+                                    TaskResult::Success(msg) => {
+                                        println!("✅ [DagScheduler] タスク '{}' 成功応答受信: {}", task.name, msg);
+                                        success = true;
+                                        break;
+                                    }
+                                    TaskResult::InfrastructureError(err) => {
+                                        eprintln!("⚙️ [DagScheduler] インフラ障害を検知 [タスク: {}]: {}. リトライ上限は消費せず別ルートへ迂回します。", task.name, err);
+                                        // 💡 敢えて retry_count をインクリメントせず、待機後に即座に別ルートを評価
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        continue;
+                                    }
+                                    TaskResult::TaskFailed(err) => {
+                                        eprintln!("⚠️ [DagScheduler] タスク自体が失敗コードを返しました [タスク: {}]: {}", task.name, err);
+                                        // コマンドレベルの失敗はカウントを消費
+                                        retry_count += 1;
+                                    }
+                                }
                             }
                             Ok(Err(e)) => {
-                                eprintln!("⚠️ [DagScheduler] 送信・実行エラー [タスク: {}]: {}", task.name, e);
+                                eprintln!("⚠️ [DagScheduler] 予期せぬ実行システムエラー [タスク: {}]: {}", task.name, e);
+                                retry_count += 1;
                             }
                             Err(_) => {
                                 eprintln!("⏱️ [DagScheduler] タイムアウト検出！ 制限時間 ({}秒) を超過しました [タスク: {}]", task.timeout_secs, task.name);
+                                retry_count += 1;
                             }
                         }
 
-                        retry_count += 1;
                         if retry_count >= task.max_retries {
                             eprintln!("❌ [DagScheduler] タスク '{}' は最大再送回数に達したため失敗しました。", task.name);
                             break;
                         }
 
-                        println!("🔄 [DagScheduler] 代替経路または再送によるリトライまで待機中...");
+                        println!("🔄 [DagScheduler] 再送または迂回リトライまで待機中...");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
 
@@ -175,9 +189,9 @@ impl DagScheduler {
                     if success {
                         let mut c_guard = completed_clone.lock().await;
                         c_guard.insert(task.name.clone());
-                        println!("✅ [DagScheduler] タスク '{}' 完了", task.name);
+                        println!("🏁 [DagScheduler] タスク '{}' 完了処理を確定", task.name);
                     } else {
-                        println!("💀 [DagScheduler] タスク '{}' 救済不能", task.name);
+                        println!("💀 [DagScheduler] タスク '{}' 救済不能として確定", task.name);
                     }
                     
                     notify_clone.notify_one();

@@ -8,16 +8,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::core::graph::Task;
 use crate::core::path::PathHeader;
 use crate::core::packet::NinjaPacket;
-use crate::core::worker::WorkerRegistry; // ✨ WorkerRegistryをインポート
+use crate::core::worker::WorkerRegistry;
 
-pub type ExecutorResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+/// 🥇 🟡 TaskResult: タスクが「どのように終了したか」のコンテキストを明示する列挙型
+#[derive(Debug, Clone)]
+pub enum TaskResult {
+    /// 正常終了（ワーカーからの戻り値などのメッセージを含む）
+    Success(String),
+    /// ワーカー側の処理・コマンド実行そのものの失敗（エラーメッセージなど）
+    TaskFailed(String),
+    /// ネットワーク切断や接続拒否など、システム・通信インフラ起因のエラー（別経路リトライの対象）
+    InfrastructureError(String),
+}
+
+pub type ExecutorResult = Result<TaskResult, Box<dyn std::error::Error + Send + Sync>>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// ----------------------------------------------------
-/// 実行だけを担当するシンプルな Executor トレイト
+/// 実行と結果判定を担当する Executor トレイト
 /// ----------------------------------------------------
 pub trait Executor: Send + Sync {
-    /// 指定されたターゲット（ワーカー）へタスクを送信し、実行を委ねる
+    /// 指定されたターゲット（ワーカー）へタスクを送信し、詳細な実行結果（TaskResult）を返す
     fn submit<'a>(
         &'a self,
         task: Task,
@@ -29,7 +40,6 @@ pub trait Executor: Send + Sync {
 /// 【Data Plane】純粋な通信実行に特化した RemoteExecutor
 /// ----------------------------------------------------
 pub struct RemoteExecutor {
-    // ✨ 内部に生の Arc<Mutex<Vec<...>>> を持たず、レジストリを受け取る
     pub registry: WorkerRegistry,
 }
 
@@ -51,7 +61,7 @@ impl Executor for RemoteExecutor {
         Box::pin(async move {
             // 1. レジストリを通じて安全にカウンタをインクリメント
             if let Err(e) = self.registry.acquire(&target_address).await {
-                return Err(e.into());
+                return Ok(TaskResult::InfrastructureError(e));
             }
 
             println!("📤 [RemoteExecutor] タスク '{}' をワーカー '{}' へ純粋送信中...", task.name, target_address);
@@ -60,8 +70,8 @@ impl Executor for RemoteExecutor {
             let packet = NinjaPacket::new(64, PathHeader::new(Vec::new()), task.command.into_bytes());
             let serialized_data = packet.to_bytes();
 
-            // 3. ネットワーク送信処理
-            let result = async {
+            // 3. ネットワーク送信および応答パース処理
+            let network_result: Result<TaskResult, Box<dyn std::error::Error + Send + Sync>> = async {
                 let mut stream = TcpStream::connect(&target_address).await?;
                 
                 let len_bytes = (serialized_data.len() as u32).to_be_bytes();
@@ -72,21 +82,30 @@ impl Executor for RemoteExecutor {
                 let mut ack_buf = [0u8; 4];
                 let _ = stream.read(&mut ack_buf).await;
                 
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                let response_str = String::from_utf8_lossy(&ack_buf).trim().to_string();
+                if response_str.starts_with("OK") {
+                    Ok(TaskResult::Success(response_str))
+                } else {
+                    Ok(TaskResult::TaskFailed(format!("ワーカー側で不正な応答を検出: {}", response_str)))
+                }
             }.await;
 
             // 4. レジストリを通じて確実に解放
             self.registry.release(&target_address).await;
 
-            // 5. 結果の返却
-            match result {
-                Ok(_) => {
-                    println!("👍 [RemoteExecutor] タスク '{}' の送信・応答確認が成功", task.name);
-                    Ok(())
+            // 5. 結果の判定とラップ
+            match network_result {
+                Ok(task_res) => {
+                    match &task_res {
+                        TaskResult::Success(_) => println!("👍 [RemoteExecutor] タスク '{}' が正常終了", task.name),
+                        TaskResult::TaskFailed(e) => println!("⚠️ [RemoteExecutor] タスク '{}' がワーカー側で失敗: {}", task.name, e),
+                        _ => {}
+                    }
+                    Ok(task_res)
                 }
                 Err(e) => {
-                    eprintln!("💥 [RemoteExecutor] タスク '{}' の通信中にエラーが発生: {}", task.name, e);
-                    Err(e)
+                    eprintln!("💥 [RemoteExecutor] 通信インフラレベルのエラーを検出 [タスク: {}]: {}", task.name, e);
+                    Ok(TaskResult::InfrastructureError(e.to_string()))
                 }
             }
         })
