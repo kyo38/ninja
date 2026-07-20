@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("📡 [Ninja Client] クラスタ/サーバーへの接続を試みています...");
 
     // 1. サーバーの待ち受けポート（デフォルト: 8080）に接続
-    let addr = "127.0.0.1:8080";
+    let addr = "127.0.0.1:9000";
     let mut stream = match TcpStream::connect(addr).await {
         Ok(s) => {
             println!("✓ [Ninja Client] サーバー ( {} ) に正常に接続しました。", addr);
