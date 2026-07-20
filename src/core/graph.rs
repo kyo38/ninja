@@ -6,9 +6,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
 
-// 修正点: 具象クラスではなく、抽象化トレイトをインポート
-use crate::core::executor::Executor;
-use crate::core::path::PathStrategy;
+use crate::core::executor::{Executor, WorkerSession};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -68,8 +66,26 @@ impl DagScheduler {
         ready
     }
 
-    // 修正点: 具象型から Arc<dyn Executor> トレイトオブジェクトへの変更
-    pub async fn run(&mut self, executor: Arc<dyn Executor>) {
+    /// ✨ 修正: &self を排除した関連関数 (associated function) へ変更。
+    /// これにより、tokio::spawn のスレッドに self の所有権や借用が流出するのを完全に防ぎます。
+    fn select_best_worker(workers: &[WorkerSession]) -> Result<String, String> {
+        let chosen = workers
+            .iter()
+            .filter(|w| w.is_alive)
+            .min_by_key(|w| w.active_tasks * 10 + (w.latency_ms as usize));
+
+        if let Some(worker) = chosen {
+            Ok(worker.address.clone())
+        } else {
+            Err("❌ 有効な稼働中のワーカーが見つかりません。".to_string())
+        }
+    }
+
+    pub async fn run(
+        &mut self, 
+        executor: Arc<dyn Executor>, 
+        workers_session: Arc<Mutex<Vec<WorkerSession>>>
+    ) {
         let completed = Arc::new(Mutex::new(HashSet::new()));
         let running = Arc::new(Mutex::new(HashSet::new()));
         
@@ -98,13 +114,15 @@ impl DagScheduler {
             }
 
             for task_name in ready_tasks {
+                // ✨ 修正: スレッドを立ち上げる前に、必要なデータ (Task) を self から完全に clone して切り離します。
                 let task = self.tasks.get(&task_name).unwrap().clone();
+                
                 let executor_clone = Arc::clone(&executor);
+                let workers_clone = Arc::clone(&workers_session);
                 let completed_clone = Arc::clone(&completed);
                 let running_clone = Arc::clone(&running);
                 let notify_clone = Arc::clone(&notify_loop_event);
 
-                // 実行中フラグを先に立てる
                 running.lock().await.insert(task_name.clone());
 
                 tokio::spawn(async move {
@@ -112,30 +130,52 @@ impl DagScheduler {
                     let mut success = false;
 
                     loop {
+                        // ✨ 修正: スタティックメソッドとして呼び出し (self の参照を含まない)
+                        let target_worker_res = {
+                            let workers = workers_clone.lock().await;
+                            Self::select_best_worker(&workers)
+                        };
+
+                        let target_address = match target_worker_res {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                eprintln!("⚠️ [DagScheduler] パス選択失敗 [タスク: {}]: {}", task.name, e);
+                                retry_count += 1;
+                                if retry_count >= task.max_retries { break; }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                        };
+
                         println!(
-                            "🎯 [DagScheduler] パス計算・投入 [試行 {}/{}]: タスク '{}'",
-                            retry_count + 1, task.max_retries, task.name
+                            "🎯 [DagScheduler] パス決定 -> ターゲット: {} [試行 {}/{}]: タスク '{}'",
+                            target_address, retry_count + 1, task.max_retries, task.name
                         );
 
-                        // トレイトのsubmitメソッド経由で、内部のパス選択から実行・解放までを安全に委ねる
-                        match executor_clone.submit(task.clone(), PathStrategy::Fastest).await {
-                            Ok(_) => {
+                        let timeout_duration = Duration::from_secs(task.timeout_secs);
+                        let exec_future = executor_clone.submit(task.clone(), target_address.clone());
+
+                        match tokio::time::timeout(timeout_duration, exec_future).await {
+                            Ok(Ok(_)) => {
                                 success = true;
                                 break;
                             }
-                            Err(e) => {
-                                eprintln!("⚠️ [DagScheduler] 実行失敗 [タスク: {}]: {}", task.name, e);
-
-                                retry_count += 1;
-                                if retry_count >= task.max_retries {
-                                    eprintln!("❌ [DagScheduler] タスク '{}' は最大再送回数に達したため失敗しました。", task.name);
-                                    break;
-                                }
-
-                                println!("🔄 [DagScheduler] 代替経路によるリトライまで待機中...");
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(Err(e)) => {
+                                eprintln!("⚠️ [DagScheduler] 送信・実行エラー [タスク: {}]: {}", task.name, e);
+                            }
+                            Err(_) => {
+                                eprintln!("⏱️ [DagScheduler] タイムアウト検出！ 制限時間 ({}秒) を超過しました [タスク: {}]", task.timeout_secs, task.name);
                             }
                         }
+
+                        retry_count += 1;
+                        if retry_count >= task.max_retries {
+                            eprintln!("❌ [DagScheduler] タスク '{}' は最大再送回数に達したため失敗しました。", task.name);
+                            break;
+                        }
+
+                        println!("🔄 [DagScheduler] 代替経路または再送によるリトライまで待機中...");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
 
                     let mut r_guard = running_clone.lock().await;

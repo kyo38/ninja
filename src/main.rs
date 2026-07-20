@@ -70,10 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 具象型としてインスタンスを生成
     let remote_executor = Arc::new(RemoteExecutor::new(vec![worker1, worker2]));
 
-    // ハートビートとレイテンシ測定ループを開始（RemoteExecutor 固有の処理）
+    // ハートビートとレイテンシ測定ループを開始
     remote_executor.start_heartbeat_loop(Duration::from_secs(2), Duration::from_millis(500)).await;
 
-    // 修正点: スケジューラへ渡すために抽象トレイトの型（dyn Executor）へキャスト
+    // スケジューラの引数用に、あらかじめワーカーセッションのポインタをクローンしておく
+    let workers_session = Arc::clone(&remote_executor.workers);
+
+    // スケジューラへ渡すために抽象トレイトの型（dyn Executor）へアップキャスト
     let executor: Arc<dyn Executor> = remote_executor;
 
     println!("✅ [Initialize] システムの初期化が正常に完了しました。");
@@ -112,7 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let mut scheduler = DagScheduler::new(tasks)?;
-    scheduler.run(executor).await;
+    
+    // 修正点: 実行の責務を担う executor と、管理・戦略のための workers_session を両方渡す
+    scheduler.run(executor, workers_session).await;
 
     println!("🧹 [Shutdown] システムの終了クリーンアップを開始します...");
     tokio::time::sleep(Duration::from_millis(500)).await;
