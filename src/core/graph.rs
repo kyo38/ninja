@@ -7,7 +7,8 @@ use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
 
 use crate::core::executor::Executor;
-use crate::core::worker::{WorkerRegistry, WorkerSession}; // ✨ WorkerRegistry と WorkerSession をインポート
+use crate::core::worker::WorkerRegistry;
+use crate::core::path::PathStrategy; // ✨ PathStrategy トレイトをインポート
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -67,26 +68,14 @@ impl DagScheduler {
         ready
     }
 
-    /// パス選択のインラインアルゴリズム
-    /// スナップショットとして渡されたセッション一覧から、最も低負荷なワーカーを選択します。
-    fn select_best_worker(workers: &[WorkerSession]) -> Result<String, String> {
-        let chosen = workers
-            .iter()
-            .filter(|w| w.is_alive)
-            .min_by_key(|w| w.active_tasks * 10 + (w.latency_ms as usize));
+    // 🔴 修正点: インラインにあった `select_best_worker` メソッドを完全に削除しました。
 
-        if let Some(worker) = chosen {
-            Ok(worker.address.clone())
-        } else {
-            Err("❌ 有効な稼働中のワーカーが見つかりません。".to_string())
-        }
-    }
-
-    /// ✨ 修正: 生のベクタではなく、WorkerRegistry を直接受け取る形に変更
+    /// ✨ 修正: 引数に `Arc<dyn PathStrategy>` を追加し、パス決定を動的に外部委ねできるように統合
     pub async fn run(
         &mut self, 
         executor: Arc<dyn Executor>, 
         registry: WorkerRegistry,
+        strategy: Arc<dyn PathStrategy>, // ✨ 戦略オブジェクトを受け取る
     ) {
         let completed = Arc::new(Mutex::new(HashSet::new()));
         let running = Arc::new(Mutex::new(HashSet::new()));
@@ -119,7 +108,8 @@ impl DagScheduler {
                 let task = self.tasks.get(&task_name).unwrap().clone();
                 
                 let executor_clone = Arc::clone(&executor);
-                let registry_clone = registry.clone(); // ✨ レジストリを安全にクローンしてタスクスレッドへ
+                let registry_clone = registry.clone();
+                let strategy_clone = Arc::clone(&strategy); // ✨ スレッド用に戦略をクローン
                 let completed_clone = Arc::clone(&completed);
                 let running_clone = Arc::clone(&running);
                 let notify_clone = Arc::clone(&notify_loop_event);
@@ -131,10 +121,10 @@ impl DagScheduler {
                     let mut success = false;
 
                     loop {
-                        // ✨ 修正: レジストリからスナップショットを取得して評価する
+                        // ✨ 修正: 注入された戦略オブジェクトの `select_path` を呼び出して統合
                         let target_worker_res = {
                             let workers = registry_clone.get_cloned_sessions().await;
-                            Self::select_best_worker(&workers)
+                            strategy_clone.select_path(&workers)
                         };
 
                         let target_address = match target_worker_res {

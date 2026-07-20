@@ -8,7 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::core::executor::{Executor, RemoteExecutor};
 use crate::core::graph::{DagScheduler, Task};
 use crate::core::packet::NinjaPacket;
-use crate::core::worker::WorkerRegistry; // ✨ WorkerRegistry をインポート
+use crate::core::worker::WorkerRegistry;
+use crate::core::path::LeastLoadStrategy; // ✨ 修正: 具体的なパス選択戦略をインポート
 
 /// 【Data Plane】ネットワーク経由でパケットを受信して処理するリアルワーカー
 async fn start_real_worker_server(address: String) {
@@ -63,13 +64,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_real_worker_server(worker2.clone()).await;
     println!("📡 [Data Plane/Worker] {} でTCPパケットレシーバーが稼働中...", worker2);
 
-    // ✨ 🥇 ① WorkerRegistryの導入による一元管理化
+    // WorkerRegistryの生成
     let registry = WorkerRegistry::new(vec![worker1, worker2]);
 
-    // ✨ ハートビートのループ管理もレジストリ単体で自律駆動させる
+    // ハートビートのループ管理
     registry.start_heartbeat_loop(Duration::from_secs(2)).await;
 
-    // ✨ 具象エグゼキュータにレジストリを渡して初期化
+    // ✨ 🥇 ① 具体的なパス選択戦略オブジェクト（LeastLoadStrategy）を生成
+    let strategy = Arc::new(LeastLoadStrategy);
+
+    // 具象エグゼキュータにレジストリを渡して初期化
     let remote_executor = Arc::new(RemoteExecutor::new(registry.clone()));
 
     // スケジューラへ渡すために抽象トレイトの型（dyn Executor）へアップキャスト
@@ -112,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut scheduler = DagScheduler::new(tasks)?;
     
-    // ✨ 修正: 一元管理された registry をそのままスケジューラへ引き渡す
-    scheduler.run(executor, registry.clone()).await;
+    // ✨ 修正: 抽象化された executor, 一元管理された registry、そして分離統合された strategy を引き渡す
+    scheduler.run(executor, registry.clone(), strategy).await;
 
     println!("🧹 [Shutdown] システムの終了クリーンアップを開始します...");
     tokio::time::sleep(Duration::from_millis(500)).await;
