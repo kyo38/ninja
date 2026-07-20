@@ -1,45 +1,55 @@
 ==================================================
 Scion → Ninja Roadmap
-分散DAG実行基盤 実験プロジェクト
+Distributed DAG Execution Engine (Experimental)
 ==================================================
 
-■ 概要
+■ Overview
 --------------------------------------------------
-本プロジェクトは、DAG（有向非巡回グラフ）に基づくタスク依存関係を
-分散環境で安全に実行するための制御基盤である。
+This project is an experimental distributed execution engine
+based on DAG (Directed Acyclic Graph) task dependencies.
 
-非同期環境における「順序保証問題」を解決するため、
-状態同期と依存解決を組み合わせた実行モデルを実装する。
+It focuses on solving the "execution order guarantee problem"
+in asynchronous environments by combining:
 
---------------------------------------------------
-■ 何が新しいのか
---------------------------------------------------
-DAGベース実行と状態同期（state_map + notify）により、
-非同期環境でも確実な順序保証を実現する。
+- Dependency resolution
+- State synchronization
+- Notification-based completion
 
 --------------------------------------------------
-■ 現在のステータス
+■ What Makes This Interesting
 --------------------------------------------------
-Phase1: 完了
-- DAG順序保証 ✔
-- 非同期バグ修正 ✔
-- 基本実行フロー ✔
+This system ensures strict execution order in an asynchronous
+distributed environment using:
 
-Phase2: 開発中
-- リトライ機構（未）
-- タイムアウト制御（未）
-- 並列制御（検証中）
+- state_map for task state tracking
+- notify mechanism for completion signaling
 
-Phase3: 未着手
-- 分散スケジューリング
-- Worker自動スケール
-
-Phase4: 未着手
-- セキュリティ
-- 認証 / 認可
+This eliminates race conditions and premature execution.
 
 --------------------------------------------------
-■ アーキテクチャ
+■ Current Status
+--------------------------------------------------
+
+Phase 1: Completed
+- DAG execution ordering ✔
+- Async bug fix ✔
+- Core execution flow ✔
+
+Phase 2: In Progress
+- Retry mechanism (TODO)
+- Timeout control (TODO)
+- Parallelism control (Testing)
+
+Phase 3: Planned
+- Distributed scheduling
+- Auto-scaling workers
+
+Phase 4: Planned
+- Security
+- Authentication / Authorization
+
+--------------------------------------------------
+■ Architecture
 --------------------------------------------------
 
           +---------+
@@ -58,13 +68,13 @@ Phase4: 未着手
  | Worker |  | Worker |  | Worker |
  +--------+  +--------+  +--------+
 
-【通信】
-- Client → Master : タスク投入
-- Master → Worker : タスク割当
-- Worker → Master : 完了通知
+Communication:
+- Client → Master : Submit tasks
+- Master → Worker : Assign tasks
+- Worker → Master : Notify completion
 
 --------------------------------------------------
-■ タスク定義（例）
+■ Task Definition (Example)
 --------------------------------------------------
 
 {
@@ -77,102 +87,103 @@ Phase4: 未着手
 }
 
 --------------------------------------------------
-■ 実行モデル
+■ Execution Model
 --------------------------------------------------
 
-1. Masterが全タスクを管理
-2. 依存関係を解決
-3. 実行可能タスクのみWorkerへ割当
-4. Workerは完了後に通知
-5. state_mapを更新し次タスクを解放
+1. Master manages all tasks
+2. Dependencies are resolved
+3. Only executable tasks are assigned
+4. Workers execute tasks
+5. Completion is notified back to Master
+6. state_map updates unlock next tasks
 
 --------------------------------------------------
-■ Worker状態遷移
+■ Worker State Transition
 --------------------------------------------------
 
 Idle → Assigned → Running → Completed → Notify
 
 --------------------------------------------------
-■ 非同期バグと修正
+■ Async Bug & Fix
 --------------------------------------------------
 
-【問題】
-依存タスクが完了する前に後続タスクが実行される
-（フライング実行）
+Problem:
+Tasks were executed before dependencies were completed
+("premature execution")
 
-【原因】
-非同期処理において完了待ちが保証されていなかった
+Cause:
+Lack of proper synchronization in async processing
 
-【修正】
-- state_map による状態管理
-- Notify による完了通知
-- 依存解決ロジックの導入
+Fix:
+- Introduced state_map for tracking
+- Added notify mechanism
+- Implemented dependency resolution
 
-【結果】
-DAG順序保証を実現
+Result:
+Strict DAG execution order achieved
 
 --------------------------------------------------
-■ 実行手順
+■ How to Run
 --------------------------------------------------
 
-1. リポジトリを取得
+1. Clone repository
 
    git clone <repo>
 
-2. Masterを起動
+2. Start Master
 
    cargo run --bin master
 
-3. Workerを複数起動
+3. Start Workers (multiple)
 
    cargo run --bin worker
 
-4. Clientからタスク投入
+4. Submit tasks
 
    cargo run --bin client
 
 --------------------------------------------------
-■ 並列実行確認
+■ Parallel Execution
 --------------------------------------------------
 
-- Workerを複数起動することで並列処理を確認可能
-- 依存のないタスクは同時実行される
+- Run multiple workers to enable parallelism
+- Independent tasks execute concurrently
 
 --------------------------------------------------
-■ 今後のロードマップ
+■ Roadmap
 --------------------------------------------------
 
-Phase2:
-- Retry（再試行）
-- Timeout制御
-- 並列数制限
+Phase 2:
+- Retry
+- Timeout control
+- Concurrency limits
 
-Phase3:
-- 分散スケジューリング
-- シャーディング
-- キュー最適化
+Phase 3:
+- Distributed scheduling
+- Sharding
+- Queue optimization
 
-Phase4:
-- 認証（Auth）
-- 認可（RBAC）
-- セキュア通信
+Phase 4:
+- Authentication
+- Authorization (RBAC)
+- Secure communication
 
 --------------------------------------------------
-■ 技術スタック
+■ Tech Stack
 --------------------------------------------------
 
 - Rust
-- 非同期処理（Tokio想定）
-- 分散システム設計
-- DAGスケジューリング
+- Async runtime (Tokio)
+- Distributed system design
+- DAG scheduling
 
 --------------------------------------------------
-■ このプロジェクトの目的
+■ Purpose
 --------------------------------------------------
 
-- 非同期分散処理の理解
-- DAG実行モデルの実装
-- 実務レベルの設計力強化
+- Understand async distributed systems
+- Implement DAG execution model
+- Build production-level design skills
 
 ==================================================
 END
