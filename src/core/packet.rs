@@ -1,75 +1,70 @@
 #![allow(dead_code)]
-#![allow(unused_imports)]
 
-use crate::core::path::PathHeader;
 use std::io::{Result, Error, ErrorKind};
+use crate::core::path::PathHeader;
 
-pub const FLAG_SYN: u8 = 0x01;
-pub const FLAG_ACK: u8 = 0x02;
-pub const FLAG_DATA: u8 = 0x04;
-pub const FLAG_PATH: u8 = 0x08;
-
+/// 🥈 SCIONライクな通信パケット構造体
 #[derive(Debug, Clone)]
 pub struct NinjaPacket {
-    pub flags: u8,
-    pub path: Option<PathHeader>,
-    pub payload: Vec<u8>,
+    pub ttl: u8,               // 🥈 無限ループ防止用（Time To Live）
+    pub path: PathHeader,      // 経路情報（HopFieldのリスト）
+    pub payload: Vec<u8>,      // 実際のデータ（シリアライズされたコマンドなど）
 }
 
 impl NinjaPacket {
-    pub fn new(flags: u8, path: Option<PathHeader>, payload: Vec<u8>) -> Self {
-        let mut actual_flags = flags;
-        if path.is_some() {
-            actual_flags |= FLAG_PATH;
-        }
-        Self {
-            flags: actual_flags,
-            path,
-            payload,
-        }
+    pub fn new(ttl: u8, path: PathHeader, payload: Vec<u8>) -> Self {
+        Self { ttl, path, payload }
     }
 
+    /// パケット全体をバイト列にシリアライズ
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.push(self.flags);
+        
+        // 1. TTLを1バイト書き込み
+        bytes.push(self.ttl);
 
-        if let Some(ref path_header) = self.path {
-            bytes.extend(path_header.to_bytes());
-        }
+        // 2. パスヘッダーをシリアライズして追加
+        let path_bytes = self.path.to_bytes();
+        bytes.extend(path_bytes);
 
+        // 3. ペイロード（データ本体）を追加
         bytes.extend(&self.payload);
+
         bytes
     }
 
+    /// バイト列からパケット構造体をデシリアライズ
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "データが空です"));
+            return Err(Error::new(ErrorKind::UnexpectedEof, "パケットデータが空です"));
         }
 
-        let flags = data[0];
-        let mut current_pos = 1;
-        let mut path = None;
+        // 1. TTLの読み込み
+        let ttl = data[0];
 
-        if (flags & FLAG_PATH) != 0 {
-            let (header, consumed) = PathHeader::from_bytes(&data[current_pos..])?;
-            path = Some(header);
-            current_pos += consumed;
+        // 2. パスヘッダーの読み込み
+        let (path, offset) = PathHeader::from_bytes(&data[1..])?;
+        
+        // offsetは &data[1..] からの相対位置なので、全体のインデックスは 1 + offset
+        let payload_pos = 1 + offset;
+        if data.len() < payload_pos {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "ペイロードデータが不完全です"));
         }
 
-        let payload = data[current_pos..].to_vec();
+        // 3. ペイロードの抽出
+        let payload = data[payload_pos..].to_vec();
 
-        Ok(Self { flags, path, payload })
+        Ok(Self { ttl, path, payload })
     }
 
-    pub fn is_syn(&self) -> bool {
-        (self.flags & FLAG_SYN) != 0
-    }
-
-    pub fn is_ack(&self) -> bool {
-        (self.flags & FLAG_ACK) != 0
-    }
-
-    pub fn is_data(&self) -> bool {
-        (self.flags & FLAG_DATA) != 0
+    /// 🥈 ホップを1つ進め、TTLをデクリメントする
+    /// TTLが0になった場合はエラーを返す
+    pub fn forward(&mut self) -> Result<()> {
+        if self.ttl <= 1 {
+            return Err(Error::new(ErrorKind::Other, "❌ [Packet] TTL expired (Time To Live が0になりました。パケットを破棄します)"));
+        }
+        self.ttl -= 1;
+        self.path.increment_hop();
+        Ok(())
     }
 }

@@ -15,6 +15,14 @@ pub struct PathHeader {
     pub current_index: usize,
 }
 
+/// 🥇 パス選択のポリシーを定義
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStrategy {
+    Shortest,    // 最短ホップ（構造用）
+    Fastest,     // 最速（低レイテンシ優先）
+    Available,   // 空き優先（即時実行重視）
+}
+
 impl PathHeader {
     pub fn new(hops: Vec<HopField>) -> Self {
         Self {
