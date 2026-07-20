@@ -9,7 +9,8 @@ use crate::core::executor::{Executor, RemoteExecutor};
 use crate::core::graph::{DagScheduler, Task};
 use crate::core::packet::NinjaPacket;
 use crate::core::worker::WorkerRegistry;
-use crate::core::path::LeastLoadStrategy; // ✨ 修正: 具体的なパス選択戦略をインポート
+use crate::core::path::LeastLoadStrategy;
+use crate::core::retry::DefaultRetryPolicy; // ✨ 新設したリトライポリシーをインポート
 
 /// 【Data Plane】ネットワーク経由でパケットを受信して処理するリアルワーカー
 async fn start_real_worker_server(address: String) {
@@ -70,8 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ハートビートのループ管理
     registry.start_heartbeat_loop(Duration::from_secs(2)).await;
 
-    // ✨ 🥇 ① 具体的なパス選択戦略オブジェクト（LeastLoadStrategy）を生成
+    // 具体的なパス選択戦略オブジェクト（LeastLoadStrategy）を生成
     let strategy = Arc::new(LeastLoadStrategy);
+
+    // ✨ 🥇 ① デフォルトのリトライポリシー（指数バックオフ内蔵）を生成
+    let retry_policy = Arc::new(DefaultRetryPolicy::default());
 
     // 具象エグゼキュータにレジストリを渡して初期化
     let remote_executor = Arc::new(RemoteExecutor::new(registry.clone()));
@@ -116,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut scheduler = DagScheduler::new(tasks)?;
     
-    // ✨ 修正: 抽象化された executor, 一元管理された registry、そして分離統合された strategy を引き渡す
-    scheduler.run(executor, registry.clone(), strategy).await;
+    // ✨ 修正: 抽象化された外出しオブジェクト達（executor, registry, strategy, retry_policy）を完全に引き渡す
+    scheduler.run(executor, registry.clone(), strategy, retry_policy).await;
 
     println!("🧹 [Shutdown] システムの終了クリーンアップを開始します...");
     tokio::time::sleep(Duration::from_millis(500)).await;

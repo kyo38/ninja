@@ -10,15 +10,17 @@ use crate::core::path::PathHeader;
 use crate::core::packet::NinjaPacket;
 use crate::core::worker::WorkerRegistry;
 
-/// 🥇 🟡 TaskResult: タスクが「どのように終了したか」のコンテキストを明示する列挙型
+/// 🥈 🟡 TaskResult: タスクの終了コンテキストを詳細に保持する構造化列挙型
 #[derive(Debug, Clone)]
 pub enum TaskResult {
-    /// 正常終了（ワーカーからの戻り値などのメッセージを含む）
+    /// 正常終了（ワーカーからの戻り値メッセージを含む）
     Success(String),
-    /// ワーカー側の処理・コマンド実行そのものの失敗（エラーメッセージなど）
-    TaskFailed(String),
-    /// ネットワーク切断や接続拒否など、システム・通信インフラ起因のエラー（別経路リトライの対象）
-    InfrastructureError(String),
+    /// ワーカー側の処理・コマンド実行そのものの失敗
+    TaskFailed { reason: String },
+    /// 応答が時間内に返ってこなかった
+    Timeout,
+    /// ネットワーク切断や接続拒否など、システム・通信インフラ起因のエラー（node: 発生元アドレス）
+    InfraError { node: String, reason: String },
 }
 
 pub type ExecutorResult = Result<TaskResult, Box<dyn std::error::Error + Send + Sync>>;
@@ -59,9 +61,14 @@ impl Executor for RemoteExecutor {
         target_address: String,
     ) -> BoxFuture<'a, ExecutorResult> {
         Box::pin(async move {
+            let node_addr = target_address.clone();
+
             // 1. レジストリを通じて安全にカウンタをインクリメント
             if let Err(e) = self.registry.acquire(&target_address).await {
-                return Ok(TaskResult::InfrastructureError(e));
+                return Ok(TaskResult::InfraError {
+                    node: node_addr,
+                    reason: format!("レジストリでのアクワイアに失敗: {}", e),
+                });
             }
 
             println!("📤 [RemoteExecutor] タスク '{}' をワーカー '{}' へ純粋送信中...", task.name, target_address);
@@ -86,7 +93,9 @@ impl Executor for RemoteExecutor {
                 if response_str.starts_with("OK") {
                     Ok(TaskResult::Success(response_str))
                 } else {
-                    Ok(TaskResult::TaskFailed(format!("ワーカー側で不正な応答を検出: {}", response_str)))
+                    Ok(TaskResult::TaskFailed {
+                        reason: format!("ワーカー側で不正な応答を検出: {}", response_str),
+                    })
                 }
             }.await;
 
@@ -98,14 +107,17 @@ impl Executor for RemoteExecutor {
                 Ok(task_res) => {
                     match &task_res {
                         TaskResult::Success(_) => println!("👍 [RemoteExecutor] タスク '{}' が正常終了", task.name),
-                        TaskResult::TaskFailed(e) => println!("⚠️ [RemoteExecutor] タスク '{}' がワーカー側で失敗: {}", task.name, e),
+                        TaskResult::TaskFailed { reason } => println!("⚠️ [RemoteExecutor] タスク '{}' がワーカー側で失敗: {}", task.name, reason),
                         _ => {}
                     }
                     Ok(task_res)
                 }
                 Err(e) => {
                     eprintln!("💥 [RemoteExecutor] 通信インフラレベルのエラーを検出 [タスク: {}]: {}", task.name, e);
-                    Ok(TaskResult::InfrastructureError(e.to_string()))
+                    Ok(TaskResult::InfraError {
+                        node: node_addr,
+                        reason: e.to_string(),
+                    })
                 }
             }
         })

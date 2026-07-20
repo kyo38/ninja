@@ -6,9 +6,10 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
 
-use crate::core::executor::{Executor, TaskResult}; // ✨ TaskResult をインポート
+use crate::core::executor::{Executor, TaskResult};
 use crate::core::worker::WorkerRegistry;
 use crate::core::path::PathStrategy;
+use crate::core::retry::RetryPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -73,6 +74,7 @@ impl DagScheduler {
         executor: Arc<dyn Executor>, 
         registry: WorkerRegistry,
         strategy: Arc<dyn PathStrategy>,
+        retry_policy: Arc<dyn RetryPolicy>,
     ) {
         let completed = Arc::new(Mutex::new(HashSet::new()));
         let running = Arc::new(Mutex::new(HashSet::new()));
@@ -107,6 +109,7 @@ impl DagScheduler {
                 let executor_clone = Arc::clone(&executor);
                 let registry_clone = registry.clone();
                 let strategy_clone = Arc::clone(&strategy);
+                let retry_policy_clone = Arc::clone(&retry_policy);
                 let completed_clone = Arc::clone(&completed);
                 let running_clone = Arc::clone(&running);
                 let notify_clone = Arc::clone(&notify_loop_event);
@@ -114,8 +117,13 @@ impl DagScheduler {
                 running.lock().await.insert(task_name.clone());
 
                 tokio::spawn(async move {
-                    let mut retry_count = 0;
+                    let mut consumed_retries = 0;   
+                    let mut continuous_failures = 0; 
                     let mut success = false;
+                    
+                    // 💡 初期値の None への代入をやめ、型の宣言だけにすることで
+                    //    「一度も読まれずに上書きされた」という警告を根本から防ぎます。
+                    let mut last_result: Option<TaskResult>;
 
                     loop {
                         let target_worker_res = {
@@ -127,60 +135,70 @@ impl DagScheduler {
                             Ok(addr) => addr,
                             Err(e) => {
                                 eprintln!("⚠️ [DagScheduler] パス選択失敗 [タスク: {}]: {}", task.name, e);
-                                retry_count += 1;
-                                if retry_count >= task.max_retries { break; }
-                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                let mock_res = TaskResult::InfraError { 
+                                    node: "unknown".to_string(), 
+                                    reason: format!("利用可能なパスがありません: {}", e) 
+                                };
+                                
+                                let res_to_check = mock_res.clone();
+                                last_result = Some(mock_res);
+
+                                if !retry_policy_clone.should_retry(&res_to_check, consumed_retries, task.max_retries) {
+                                    break;
+                                }
+                                continuous_failures += 1;
+                                tokio::time::sleep(retry_policy_clone.backoff(continuous_failures)).await;
                                 continue;
                             }
                         };
 
                         println!(
-                            "🎯 [DagScheduler] パス決定 -> ターゲット: {} [試行 {}/{}]: タスク '{}'",
-                            target_address, retry_count + 1, task.max_retries, task.name
+                            "🎯 [DagScheduler] パス決定 -> ターゲット: {} [タスク消費リトライ: {}/{}]: タスク '{}'",
+                            target_address, consumed_retries, task.max_retries, task.name
                         );
 
                         let timeout_duration = Duration::from_secs(task.timeout_secs);
                         let exec_future = executor_clone.submit(task.clone(), target_address.clone());
 
-                        // ✨ 🥇 TaskResult に応じたインテリジェントなハンドリング
-                        match tokio::time::timeout(timeout_duration, exec_future).await {
-                            Ok(Ok(task_result)) => {
-                                match task_result {
-                                    TaskResult::Success(msg) => {
-                                        println!("✅ [DagScheduler] タスク '{}' 成功応答受信: {}", task.name, msg);
-                                        success = true;
-                                        break;
-                                    }
-                                    TaskResult::InfrastructureError(err) => {
-                                        eprintln!("⚙️ [DagScheduler] インフラ障害を検知 [タスク: {}]: {}. リトライ上限は消費せず別ルートへ迂回します。", task.name, err);
-                                        // 💡 敢えて retry_count をインクリメントせず、待機後に即座に別ルートを評価
-                                        tokio::time::sleep(Duration::from_millis(100)).await;
-                                        continue;
-                                    }
-                                    TaskResult::TaskFailed(err) => {
-                                        eprintln!("⚠️ [DagScheduler] タスク自体が失敗コードを返しました [タスク: {}]: {}", task.name, err);
-                                        // コマンドレベルの失敗はカウントを消費
-                                        retry_count += 1;
-                                    }
-                                }
+                        let current_res = match tokio::time::timeout(timeout_duration, exec_future).await {
+                            Ok(Ok(task_result)) => task_result,
+                            Ok(Err(e)) => TaskResult::InfraError {
+                                node: target_address.clone(),
+                                reason: format!("システム内部実行エラー: {}", e),
+                            },
+                            Err(_) => TaskResult::Timeout,
+                        };
+
+                        let res_to_check = current_res.clone();
+                        last_result = Some(current_res);
+
+                        match &res_to_check {
+                            TaskResult::Success(msg) => {
+                                println!("✅ [DagScheduler] タスク '{}' 成功応答受信: {}", task.name, msg);
+                                success = true;
+                                break;
                             }
-                            Ok(Err(e)) => {
-                                eprintln!("⚠️ [DagScheduler] 予期せぬ実行システムエラー [タスク: {}]: {}", task.name, e);
-                                retry_count += 1;
+                            TaskResult::InfraError { node, reason } => {
+                                eprintln!("⚙️ [DagScheduler] インフラ障害を検知 [ノード: {}]: {}. リトライ上限は消費せず別ルート迂回を試みます。", node, reason);
                             }
-                            Err(_) => {
-                                eprintln!("⏱️ [DagScheduler] タイムアウト検出！ 制限時間 ({}秒) を超過しました [タスク: {}]", task.timeout_secs, task.name);
-                                retry_count += 1;
+                            TaskResult::TaskFailed { reason } => {
+                                eprintln!("⚠️ [DagScheduler] タスク自体が失敗コードを返しました: {}", reason);
+                                consumed_retries += 1;
+                            }
+                            TaskResult::Timeout => {
+                                eprintln!("⏱️ [DagScheduler] タイムアウトを検出しました（{}秒超過）", task.timeout_secs);
+                                consumed_retries += 1;
                             }
                         }
 
-                        if retry_count >= task.max_retries {
-                            eprintln!("❌ [DagScheduler] タスク '{}' は最大再送回数に達したため失敗しました。", task.name);
+                        if !retry_policy_clone.should_retry(&res_to_check, consumed_retries, task.max_retries) {
                             break;
                         }
 
-                        println!("🔄 [DagScheduler] 再送または迂回リトライまで待機中...");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continuous_failures += 1;
+                        let next_backoff = retry_policy_clone.backoff(continuous_failures);
+                        println!("🔄 [DagScheduler] 次のリトライ・迂回まで待機中... (待機時間: {:?})", next_backoff);
+                        tokio::time::sleep(next_backoff).await;
                     }
 
                     let mut r_guard = running_clone.lock().await;
@@ -191,7 +209,7 @@ impl DagScheduler {
                         c_guard.insert(task.name.clone());
                         println!("🏁 [DagScheduler] タスク '{}' 完了処理を確定", task.name);
                     } else {
-                        println!("💀 [DagScheduler] タスク '{}' 救済不能として確定", task.name);
+                        println!("💀 [DagScheduler] タスク '{}' 救済不能として確定。最終ステータス: {:?}", task.name, last_result);
                     }
                     
                     notify_clone.notify_one();
