@@ -91,7 +91,7 @@ impl DagScheduler {
     /// 状態マップを元に、実行可能なタスクを抽出
     pub fn get_ready_tasks(&self, state_map: &HashMap<String, TaskState>) -> Vec<String> {
         let mut ready = Vec::new();
-        for (task_id, _) in &self.in_degree {
+        for task_id in self.in_degree.keys() {
             if let Some(&state) = state_map.get(task_id) {
                 if state != TaskState::Pending {
                     continue;
@@ -170,7 +170,6 @@ impl DagScheduler {
                     let mut continuous_failures = 0; 
                     let mut success = false;
                     
-                    // ⚠️ 未初期化宣言にすることで再代入警告（unused_assignments）を完全に抑制
                     let mut last_result: Option<TaskResult>;
 
                     loop {
@@ -296,5 +295,74 @@ impl DagScheduler {
                 });
             }
         }
+    }
+}
+
+// =========================================================================
+// 🧪 ユニットテスト領域
+// =========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_dummy_task(name: &str, deps: Vec<&str>) -> Task {
+        Task {
+            name: name.to_string(),
+            command: "echo test".to_string(),
+            deps: deps.into_iter().map(|s| s.to_string()).collect(),
+            timeout_secs: 10,
+            max_retries: 3,
+        }
+    }
+
+    #[test]
+    fn test_dag_initialization_success() {
+        let t1 = create_dummy_task("task1", vec![]);
+        let t2 = create_dummy_task("task2", vec!["task1"]); // t2はt1に依存
+
+        let scheduler_res = DagScheduler::new(vec![t1, t2]);
+        assert!(scheduler_res.is_ok());
+
+        let scheduler = scheduler_res.unwrap();
+        // 入次数（in-degree）の検証
+        assert_eq!(*scheduler.in_degree.get("task1").unwrap(), 0);
+        assert_eq!(*scheduler.in_degree.get("task2").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_dag_initialization_missing_dependency() {
+        let t1 = create_dummy_task("task1", vec!["ghost_task"]); // 存在しないタスクに依存
+
+        let scheduler_res = DagScheduler::new(vec![t1]);
+        assert!(scheduler_res.is_err());
+        let err_msg = scheduler_res.err().unwrap();
+        assert!(err_msg.contains("見つかりません"));
+    }
+
+    #[test]
+    fn test_get_ready_tasks_filtration() {
+        let t1 = create_dummy_task("task1", vec![]);
+        let t2 = create_dummy_task("task2", vec!["task1"]);
+        let t3 = create_dummy_task("task3", vec![]);
+
+        let scheduler = DagScheduler::new(vec![t1, t2, t3]).unwrap();
+        
+        let mut state_map = HashMap::new();
+        state_map.insert("task1".to_string(), TaskState::Pending);
+        state_map.insert("task2".to_string(), TaskState::Pending);
+        state_map.insert("task3".to_string(), TaskState::Pending);
+
+        // 初期状態：依存のない task1 と task3 だけが実行可能であること
+        let mut ready = scheduler.get_ready_tasks(&state_map);
+        ready.sort();
+        assert_eq!(ready, vec!["task1".to_string(), "task3".to_string()]);
+
+        // task1 が正常完了（Success）し、task3 が実行中（Running）になったと仮定
+        state_map.insert("task1".to_string(), TaskState::Success);
+        state_map.insert("task3".to_string(), TaskState::Running);
+
+        // 次の判定：依存が解消された task2 のみが抽出されること（Runningのtask3は除外）
+        let ready_next = scheduler.get_ready_tasks(&state_map);
+        assert_eq!(ready_next, vec!["task2".to_string()]);
     }
 }
