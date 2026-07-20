@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::core::executor::{Executor, RemoteExecutor};
 use crate::core::graph::{DagScheduler, Task};
 use crate::core::packet::NinjaPacket;
+use crate::core::worker::WorkerRegistry; // ✨ WorkerRegistry をインポート
 
 /// 【Data Plane】ネットワーク経由でパケットを受信して処理するリアルワーカー
 async fn start_real_worker_server(address: String) {
@@ -20,28 +21,23 @@ async fn start_real_worker_server(address: String) {
                 Ok((mut stream, _client_addr)) => {
                     let addr_sub = addr_clone.clone();
                     tokio::spawn(async move {
-                        // 1. 先頭4バイトからパケットの長さを取得 (Big Endian)
                         let mut len_buf = [0u8; 4];
                         if stream.read_exact(&mut len_buf).await.is_err() {
                             return;
                         }
                         let packet_len = u32::from_be_bytes(len_buf) as usize;
 
-                        // 2. パケット本体をバッファに読み込む
                         let mut packet_buf = vec![0u8; packet_len];
                         if stream.read_exact(&mut packet_buf).await.is_err() {
                             return;
                         }
 
-                        // 3. 提供された packet.rs のロジックでデシリアライズ
                         if let Ok(packet) = NinjaPacket::from_bytes(&packet_buf) {
                             if let Ok(cmd_str) = String::from_utf8(packet.payload) {
                                 println!("📥 [Worker: {}] パケット受信・解析完了 -> コマンド: '{}'", addr_sub, cmd_str);
                                 
-                                // 4. 受信したタスクの擬似的な実行処理 (100msウェイト)
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                                 
-                                // 5. 完了応答 (ACK) をストリームへ返送
                                 let _ = stream.write_all(b"OK\n\n").await;
                             }
                         }
@@ -67,14 +63,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_real_worker_server(worker2.clone()).await;
     println!("📡 [Data Plane/Worker] {} でTCPパケットレシーバーが稼働中...", worker2);
 
-    // 具象型としてインスタンスを生成
-    let remote_executor = Arc::new(RemoteExecutor::new(vec![worker1, worker2]));
+    // ✨ 🥇 ① WorkerRegistryの導入による一元管理化
+    let registry = WorkerRegistry::new(vec![worker1, worker2]);
 
-    // ハートビートとレイテンシ測定ループを開始
-    remote_executor.start_heartbeat_loop(Duration::from_secs(2), Duration::from_millis(500)).await;
+    // ✨ ハートビートのループ管理もレジストリ単体で自律駆動させる
+    registry.start_heartbeat_loop(Duration::from_secs(2)).await;
 
-    // スケジューラの引数用に、あらかじめワーカーセッションのポインタをクローンしておく
-    let workers_session = Arc::clone(&remote_executor.workers);
+    // ✨ 具象エグゼキュータにレジストリを渡して初期化
+    let remote_executor = Arc::new(RemoteExecutor::new(registry.clone()));
 
     // スケジューラへ渡すために抽象トレイトの型（dyn Executor）へアップキャスト
     let executor: Arc<dyn Executor> = remote_executor;
@@ -116,8 +112,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut scheduler = DagScheduler::new(tasks)?;
     
-    // 修正点: 実行の責務を担う executor と、管理・戦略のための workers_session を両方渡す
-    scheduler.run(executor, workers_session).await;
+    // ✨ 修正: 一元管理された registry をそのままスケジューラへ引き渡す
+    scheduler.run(executor, registry.clone()).await;
 
     println!("🧹 [Shutdown] システムの終了クリーンアップを開始します...");
     tokio::time::sleep(Duration::from_millis(500)).await;

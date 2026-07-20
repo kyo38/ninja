@@ -6,7 +6,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
 
-use crate::core::executor::{Executor, WorkerSession};
+use crate::core::executor::Executor;
+use crate::core::worker::{WorkerRegistry, WorkerSession}; // ✨ WorkerRegistry と WorkerSession をインポート
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -66,8 +67,8 @@ impl DagScheduler {
         ready
     }
 
-    /// ✨ 修正: &self を排除した関連関数 (associated function) へ変更。
-    /// これにより、tokio::spawn のスレッドに self の所有権や借用が流出するのを完全に防ぎます。
+    /// パス選択のインラインアルゴリズム
+    /// スナップショットとして渡されたセッション一覧から、最も低負荷なワーカーを選択します。
     fn select_best_worker(workers: &[WorkerSession]) -> Result<String, String> {
         let chosen = workers
             .iter()
@@ -81,10 +82,11 @@ impl DagScheduler {
         }
     }
 
+    /// ✨ 修正: 生のベクタではなく、WorkerRegistry を直接受け取る形に変更
     pub async fn run(
         &mut self, 
         executor: Arc<dyn Executor>, 
-        workers_session: Arc<Mutex<Vec<WorkerSession>>>
+        registry: WorkerRegistry,
     ) {
         let completed = Arc::new(Mutex::new(HashSet::new()));
         let running = Arc::new(Mutex::new(HashSet::new()));
@@ -114,11 +116,10 @@ impl DagScheduler {
             }
 
             for task_name in ready_tasks {
-                // ✨ 修正: スレッドを立ち上げる前に、必要なデータ (Task) を self から完全に clone して切り離します。
                 let task = self.tasks.get(&task_name).unwrap().clone();
                 
                 let executor_clone = Arc::clone(&executor);
-                let workers_clone = Arc::clone(&workers_session);
+                let registry_clone = registry.clone(); // ✨ レジストリを安全にクローンしてタスクスレッドへ
                 let completed_clone = Arc::clone(&completed);
                 let running_clone = Arc::clone(&running);
                 let notify_clone = Arc::clone(&notify_loop_event);
@@ -130,9 +131,9 @@ impl DagScheduler {
                     let mut success = false;
 
                     loop {
-                        // ✨ 修正: スタティックメソッドとして呼び出し (self の参照を含まない)
+                        // ✨ 修正: レジストリからスナップショットを取得して評価する
                         let target_worker_res = {
-                            let workers = workers_clone.lock().await;
+                            let workers = registry_clone.get_cloned_sessions().await;
                             Self::select_best_worker(&workers)
                         };
 
