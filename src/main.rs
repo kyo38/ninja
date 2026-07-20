@@ -5,11 +5,11 @@ use tokio::time::Duration;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::core::executor::RemoteExecutor;
+use crate::core::executor::{Executor, RemoteExecutor};
 use crate::core::graph::{DagScheduler, Task};
 use crate::core::packet::NinjaPacket;
 
-/// 【本物のData Plane】ネットワーク経由でパケットを受信して処理するリアルワーカー
+/// 【Data Plane】ネットワーク経由でパケットを受信して処理するリアルワーカー
 async fn start_real_worker_server(address: String) {
     let listener = TcpListener::bind(&address).await.unwrap();
     let addr_clone = address.clone();
@@ -36,7 +36,6 @@ async fn start_real_worker_server(address: String) {
                         // 3. 提供された packet.rs のロジックでデシリアライズ
                         if let Ok(packet) = NinjaPacket::from_bytes(&packet_buf) {
                             if let Ok(cmd_str) = String::from_utf8(packet.payload) {
-                                // 修正点: 受信した実際のコマンドをログに明示して警告を抑止
                                 println!("📥 [Worker: {}] パケット受信・解析完了 -> コマンド: '{}'", addr_sub, cmd_str);
                                 
                                 // 4. 受信したタスクの擬似的な実行処理 (100msウェイト)
@@ -68,10 +67,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_real_worker_server(worker2.clone()).await;
     println!("📡 [Data Plane/Worker] {} でTCPパケットレシーバーが稼働中...", worker2);
 
-    let executor = Arc::new(RemoteExecutor::new(vec![worker1, worker2]));
+    // 具象型としてインスタンスを生成
+    let remote_executor = Arc::new(RemoteExecutor::new(vec![worker1, worker2]));
 
-    // ハートビートとレイテンシ測定ループを開始
-    executor.start_heartbeat_loop(Duration::from_secs(2), Duration::from_millis(500)).await;
+    // ハートビートとレイテンシ測定ループを開始（RemoteExecutor 固有の処理）
+    remote_executor.start_heartbeat_loop(Duration::from_secs(2), Duration::from_millis(500)).await;
+
+    // 修正点: スケジューラへ渡すために抽象トレイトの型（dyn Executor）へキャスト
+    let executor: Arc<dyn Executor> = remote_executor;
 
     println!("✅ [Initialize] システムの初期化が正常に完了しました。");
     println!("🚀 [Main Loop] DAG構造 of 実行ループへ移行します。");

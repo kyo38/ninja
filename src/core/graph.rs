@@ -6,9 +6,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
 
-use crate::core::executor::RemoteExecutor;
+// 修正点: 具象クラスではなく、抽象化トレイトをインポート
+use crate::core::executor::Executor;
 use crate::core::path::PathStrategy;
-use crate::core::packet::NinjaPacket;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -68,7 +68,8 @@ impl DagScheduler {
         ready
     }
 
-    pub async fn run(&mut self, executor: Arc<RemoteExecutor>) {
+    // 修正点: 具象型から Arc<dyn Executor> トレイトオブジェクトへの変更
+    pub async fn run(&mut self, executor: Arc<dyn Executor>) {
         let completed = Arc::new(Mutex::new(HashSet::new()));
         let running = Arc::new(Mutex::new(HashSet::new()));
         
@@ -97,78 +98,59 @@ impl DagScheduler {
             }
 
             for task_name in ready_tasks {
-                if let Some((worker_addr, path_header)) = executor.select_path(PathStrategy::Fastest).await {
-                    let task = self.tasks.get(&task_name).unwrap().clone();
-                    let executor_clone = Arc::clone(&executor);
-                    let completed_clone = Arc::clone(&completed);
-                    let running_clone = Arc::clone(&running);
-                    let notify_clone = Arc::clone(&notify_loop_event);
+                let task = self.tasks.get(&task_name).unwrap().clone();
+                let executor_clone = Arc::clone(&executor);
+                let completed_clone = Arc::clone(&completed);
+                let running_clone = Arc::clone(&running);
+                let notify_clone = Arc::clone(&notify_loop_event);
 
-                    running.lock().await.insert(task_name.clone());
+                // 実行中フラグを先に立てる
+                running.lock().await.insert(task_name.clone());
 
-                    tokio::spawn(async move {
-                        let mut current_worker = worker_addr;
-                        let mut current_path = path_header;
-                        let mut retry_count = 0;
-                        let mut success = false;
+                tokio::spawn(async move {
+                    let mut retry_count = 0;
+                    let mut success = false;
 
-                        loop {
-                            if let Some(hop) = current_path.current_hop() {
-                                println!(
-                                    "🎯 [DagScheduler] パス決定 [試行 {}/{}]: ワーカー({}) [NodeID: {}, RTT: {}ms] -> タスク '{}'",
-                                    retry_count + 1, task.max_retries, current_worker, hop.node_id, hop.latency_ms, task.name
-                                );
+                    loop {
+                        println!(
+                            "🎯 [DagScheduler] パス計算・投入 [試行 {}/{}]: タスク '{}'",
+                            retry_count + 1, task.max_retries, task.name
+                        );
+
+                        // トレイトのsubmitメソッド経由で、内部のパス選択から実行・解放までを安全に委ねる
+                        match executor_clone.submit(task.clone(), PathStrategy::Fastest).await {
+                            Ok(_) => {
+                                success = true;
+                                break;
                             }
+                            Err(e) => {
+                                eprintln!("⚠️ [DagScheduler] 実行失敗 [タスク: {}]: {}", task.name, e);
 
-                            let payload = task.command.clone().into_bytes();
-                            let packet = NinjaPacket::new(64, current_path.clone(), payload);
-
-                            match executor_clone.execute_remote(&current_worker, packet).await {
-                                Ok(_) => {
-                                    executor_clone.release_worker(&current_worker).await;
-                                    success = true;
+                                retry_count += 1;
+                                if retry_count >= task.max_retries {
+                                    eprintln!("❌ [DagScheduler] タスク '{}' は最大再送回数に達したため失敗しました。", task.name);
                                     break;
                                 }
-                                Err(e) => {
-                                    eprintln!("⚠️ [DagScheduler] パス異常または不達を検知 [{}]: {}", current_worker, e);
-                                    executor_clone.release_worker(&current_worker).await;
 
-                                    retry_count += 1;
-                                    if retry_count >= task.max_retries {
-                                        eprintln!("❌ [DagScheduler] タスク '{}' は最大再送回数に達したため失敗しました。", task.name);
-                                        break;
-                                    }
-
-                                    println!("🔄 [DagScheduler] 代替経路（オルタナティブ・パス）を再計算中...");
-                                    loop {
-                                        if let Some((next_worker, next_path)) = executor_clone.select_path(PathStrategy::Fastest).await {
-                                            current_worker = next_worker;
-                                            current_path = next_path;
-                                            break;
-                                        }
-                                        tokio::time::sleep(Duration::from_millis(30)).await;
-                                    }
-                                }
+                                println!("🔄 [DagScheduler] 代替経路によるリトライまで待機中...");
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
+                    }
 
-                        let mut r_guard = running_clone.lock().await;
-                        r_guard.remove(&task.name);
-                        
-                        if success {
-                            let mut c_guard = completed_clone.lock().await;
-                            c_guard.insert(task.name.clone());
-                            println!("✅ [DagScheduler] タスク '{}' 完了", task.name);
-                        } else {
-                            println!("💀 [DagScheduler] タスク '{}' 救済不能", task.name);
-                        }
-                        
-                        notify_clone.notify_one();
-                    });
-                } else {
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    break;
-                }
+                    let mut r_guard = running_clone.lock().await;
+                    r_guard.remove(&task.name);
+                    
+                    if success {
+                        let mut c_guard = completed_clone.lock().await;
+                        c_guard.insert(task.name.clone());
+                        println!("✅ [DagScheduler] タスク '{}' 完了", task.name);
+                    } else {
+                        println!("💀 [DagScheduler] タスク '{}' 救済不能", task.name);
+                    }
+                    
+                    notify_clone.notify_one();
+                });
             }
         }
     }
