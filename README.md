@@ -50,7 +50,7 @@ Phase 4: Planned
 --------------------------------------------------
 ■ Architecture
 --------------------------------------------------
-
+```text
           +---------+
           | Client  |
           +----+----+
@@ -66,7 +66,7 @@ Phase 4: Planned
  +--------+  +--------+  +--------+
  | Worker |  | Worker |  | Worker |
  +--------+  +--------+  +--------+
-
+```
 Communication:
 - Client → Master : Submit tasks
 - Master → Worker : Assign tasks
