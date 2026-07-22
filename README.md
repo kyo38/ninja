@@ -1,55 +1,63 @@
-Scion → Ninja Roadmap
+# Scion → Ninja
+
 Distributed DAG Execution Engine (Experimental)
-==============================================
 
-■ Overview
---------------------------------------------------
-This project is an experimental distributed execution engine
-based on DAG (Directed Acyclic Graph) task dependencies.
+![OS: Windows 11](https://img.shields.io/badge/OS-Windows%2011-blue?style=flat-square&logo=windows11)
+![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?style=flat-square&logo=rust)
+![IDE: VS Code](https://img.shields.io/badge/IDE-VS%20Code-007ACC?style=flat-square&logo=visualstudiocode)
 
-It focuses on solving the "execution order guarantee problem"
-in asynchronous environments by combining:
+---
 
+## ■ Overview
+
+This project is an experimental distributed execution engine based on **DAG (Directed Acyclic Graph)** task dependencies, developed specifically for Windows 11 environments using Rust and Tokio.
+
+It focuses on solving the "execution order guarantee problem" in asynchronous environments by combining:
 - Dependency resolution
 - State synchronization
 - Notification-based completion
 
---------------------------------------------------
-■ What Makes This Interesting
---------------------------------------------------
-This system ensures strict execution order in an asynchronous
-distributed environment using:
+---
 
-- state_map for task state tracking
-- notify mechanism for completion signaling
+## ■ Key Technical Highlights
 
-This eliminates race conditions and premature execution.
+This system ensures strict execution order in an asynchronous distributed environment using:
+- **`state_map`**: For real-time task state tracking.
+- **`notify` mechanism**: For explicit completion signaling across tasks.
 
---------------------------------------------------
-■ Current Status
---------------------------------------------------
+This eliminates race conditions and premature execution ("flying execution").
 
-Phase 1: Completed
-- DAG execution ordering ✔
-- Async bug fix ✔
-- Core execution flow ✔
+---
 
-Phase 2: In Progress
-- Retry mechanism (TODO)
-- Timeout control (TODO)
-- Parallelism control (Testing)
+## ■ Current Status
 
-Phase 3: Planned
-- Distributed scheduling
-- Auto-scaling workers
+* **Phase 1: Completed**
+  * DAG execution ordering ✔
+  * Async bug fix ✔
+  * Core execution flow ✔
+* **Phase 2: In Progress**
+  * Retry mechanism (TODO)
+  * Timeout control (TODO)
+  * Parallelism control (Testing)
+* **Phase 3: Planned**
+  * Distributed scheduling
+  * Auto-scaling workers
+* **Phase 4: Planned**
+  * Security
+  * Authentication / Authorization
 
-Phase 4: Planned
-- Security
-- Authentication / Authorization
+---
 
---------------------------------------------------
-■ Architecture
---------------------------------------------------
+## ■ Prerequisites
+
+* **OS:** Windows 11 (Tested & Optimized)
+* **Toolchain:** Rust (stable-x86_64-pc-windows-msvc)
+* **Environment:** VS Code (Recommended extension: `rust-analyzer`)
+
+---
+
+## ■ Architecture
+
 ```text
           +---------+
           | Client  |
@@ -67,15 +75,17 @@ Phase 4: Planned
  | Worker |  | Worker |  | Worker |
  +--------+  +--------+  +--------+
 ```
-Communication:
-- Client → Master : Submit tasks
-- Master → Worker : Assign tasks
-- Worker → Master : Notify completion
 
---------------------------------------------------
-■ Task Definition (Example)
---------------------------------------------------
+### Communication Protocol
+- **Client → Master**: Submit DAG tasks
+- **Master → Worker**: Assign executable tasks
+- **Worker → Master**: Notify execution completion
 
+---
+
+## ■ Task Definition Example
+
+```json
 {
   "tasks": [
     { "id": "A", "deps": [] },
@@ -84,105 +94,90 @@ Communication:
     { "id": "D", "deps": ["B", "C"] }
   ]
 }
+```
 
---------------------------------------------------
-■ Execution Model
---------------------------------------------------
+---
 
-1. Master manages all tasks
-2. Dependencies are resolved
-3. Only executable tasks are assigned
-4. Workers execute tasks
-5. Completion is notified back to Master
-6. state_map updates unlock next tasks
+## ■ Execution Model & Lifecycle
 
---------------------------------------------------
-■ Worker State Transition
---------------------------------------------------
+1. **Master** manages all task definitions and global DAG state.
+2. Dependencies are dynamically resolved.
+3. Only executable tasks (with all dependencies met) are assigned to **Workers**.
+4. **Workers** execute tasks asynchronously.
+5. Worker state transitions: `Idle` → `Assigned` → `Running` → `Completed` → `Notify`.
+6. Completion is notified back to Master.
+7. `state_map` updates unlock the next dependent tasks.
 
-Idle → Assigned → Running → Completed → Notify
+---
 
---------------------------------------------------
-■ Async Bug & Fix
---------------------------------------------------
+## ■ Async Bug & Technical Resolution
 
-Problem:
-Tasks were executed before dependencies were completed
-("premature execution")
+* **Problem:** Tasks were executed before their dependencies were completed (*premature execution*).
+* **Root Cause:** Lack of proper synchronization in async runtime processing.
+* **Fix Applied:**
+  * Introduced centralized `state_map` for state tracking.
+  * Added explicit `notify` mechanisms.
+  * Implemented rigorous dependency resolution logic.
+* **Result:** Achieved strict DAG execution order guarantee.
 
-Cause:
-Lack of proper synchronization in async processing
+---
 
-Fix:
-- Introduced state_map for tracking
-- Added notify mechanism
-- Implemented dependency resolution
+## ■ How to Run (Windows 11 / VS Code)
 
-Result:
-Strict DAG execution order achieved
+Run the following commands in VS Code integrated terminal (PowerShell):
 
---------------------------------------------------
-■ How to Run
---------------------------------------------------
+```powershell
+# 1. Clone repository
+git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
+cd ninja
 
-1. Clone repository
+# 2. Start Master node
+cargo run --bin master
 
-   git clone <repo>
+# 3. Start Workers (Open multiple terminals to enable parallelism)
+cargo run --bin worker
 
-2. Start Master
+# 4. Submit tasks via Client
+cargo run --bin client
+```
 
-   cargo run --bin master
+---
 
-3. Start Workers (multiple)
+## ■ Parallel Execution
 
-   cargo run --bin worker
+- Running multiple Worker processes enables parallel processing.
+- Independent tasks in the DAG execute concurrently across available Workers.
 
-4. Submit tasks
+---
 
-   cargo run --bin client
+## ■ Roadmap
 
---------------------------------------------------
-■ Parallel Execution
---------------------------------------------------
+* **Phase 2 (Reliability):**
+  * Retry mechanism
+  * Timeout control
+  * Concurrency limits
+* **Phase 3 (Scalability):**
+  * Distributed scheduling
+  * Sharding
+  * Queue optimization
+* **Phase 4 (Security):**
+  * Authentication (Auth)
+  * Authorization (RBAC)
+  * Secure communication
 
-- Run multiple workers to enable parallelism
-- Independent tasks execute concurrently
+---
 
---------------------------------------------------
-■ Roadmap
---------------------------------------------------
+## ■ Tech Stack
 
-Phase 2:
-- Retry
-- Timeout control
-- Concurrency limits
+* **Language:** Rust
+* **Async Runtime:** Tokio
+* **Architecture:** Distributed Systems / DAG Scheduling
+* **Target OS:** Windows 11
 
-Phase 3:
-- Distributed scheduling
-- Sharding
-- Queue optimization
+---
 
-Phase 4:
-- Authentication
-- Authorization (RBAC)
-- Secure communication
+## ■ Project Purpose
 
---------------------------------------------------
-■ Tech Stack
---------------------------------------------------
-
-- Rust
-- Async runtime (Tokio)
-- Distributed system design
-- DAG scheduling
-
---------------------------------------------------
-■ Purpose
---------------------------------------------------
-
-- Understand async distributed systems
-- Implement DAG execution model
-- Build production-level design skills
-
-
-
+- Deepen understanding of asynchronous distributed system architecture.
+- Build a robust, production-grade DAG task execution model in Rust.
+- Enhance systems engineering and concurrency design skills.
