@@ -60,14 +60,13 @@ Phase 4: Planned
           | Master  |
           +----+----+
                |
-               v
      +-----------------------+
      |           |           |
      v           v           v
  +--------+  +--------+  +--------+
  | Worker |  | Worker |  | Worker |
  +--------+  +--------+  +--------+
-
+--------------------------------------------------
 Communication:
 - Client → Master : Submit tasks
 - Master → Worker : Assign tasks
