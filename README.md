@@ -1,4 +1,3 @@
-==============================================
 Scion → Ninja Roadmap
 Distributed DAG Execution Engine (Experimental)
 ==============================================
