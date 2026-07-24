@@ -64,7 +64,7 @@ This eliminates race conditions and premature execution ("flying execution").
           | Master  |
           +----+----+
                |
-   +-----------------------+
+   +-----------+-----------+
    |           |           |
    v           v           v
  +--------+  +--------+  +--------+
