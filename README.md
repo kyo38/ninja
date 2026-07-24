@@ -12,18 +12,15 @@ Distributed DAG Execution Engine (Experimental)
 
 This project is an experimental distributed execution engine based on **DAG (Directed Acyclic Graph)** task dependencies, developed specifically for Windows 11 environments using Rust and Tokio.
 
-It focuses on solving the "execution order guarantee problem" in asynchronous environments by combining:
-- Dependency resolution
-- State synchronization
-- Notification-based completion
+It focuses on solving the "execution order guarantee problem" in asynchronous environments by combining dependency resolution and state synchronization.
 
 ---
 
 ## ■ Key Technical Highlights
 
 This system ensures strict execution order in an asynchronous distributed environment using:
-- **`state_map`**: For real-time task state tracking.
-- **`notify` mechanism**: For explicit completion signaling across tasks.
+- **`state_map`**: For real-time task state tracking and management.
+- **`notify` mechanism**: For explicit completion signaling and execution control.
 
 This eliminates race conditions and premature execution ("flying execution").
 
@@ -36,8 +33,8 @@ This eliminates race conditions and premature execution ("flying execution").
   * Async bug fix ✔
   * Core execution flow ✔
 * **Phase 2: In Progress**
-  * Retry mechanism (TODO)
-  * Timeout control (TODO)
+  * Retry mechanism (Pending)
+  * Timeout control (Pending)
   * Parallelism control (Testing)
 * **Phase 3: Planned**
   * Distributed scheduling
@@ -50,15 +47,14 @@ This eliminates race conditions and premature execution ("flying execution").
 
 ## ■ Prerequisites
 
-* **OS:** Windows 11 (Tested & Optimized)
+* **OS:** Windows 11 (Pro / Home)
 * **Toolchain:** Rust (stable-x86_64-pc-windows-msvc)
-* **Environment:** VS Code (Recommended extension: `rust-analyzer`)
+* **IDE:** VS Code (Recommended extension: `rust-analyzer`)
 
 ---
 
 ## ■ Architecture
 
-```text
           +---------+
           | Client  |
           +----+----+
@@ -74,10 +70,9 @@ This eliminates race conditions and premature execution ("flying execution").
  +--------+  +--------+  +--------+
  | Worker |  | Worker |  | Worker |
  +--------+  +--------+  +--------+
-```
 
 ### Communication Protocol
-- **Client → Master**: Submit DAG tasks
+- **Client → Master**: Submit DAG tasks and definitions
 - **Master → Worker**: Assign executable tasks
 - **Worker → Master**: Notify execution completion
 
@@ -85,7 +80,6 @@ This eliminates race conditions and premature execution ("flying execution").
 
 ## ■ Task Definition Example
 
-```json
 {
   "tasks": [
     { "id": "A", "deps": [] },
@@ -94,7 +88,6 @@ This eliminates race conditions and premature execution ("flying execution").
     { "id": "D", "deps": ["B", "C"] }
   ]
 }
-```
 
 ---
 
@@ -113,11 +106,11 @@ This eliminates race conditions and premature execution ("flying execution").
 ## ■ Async Bug & Technical Resolution
 
 * **Problem:** Tasks were executed before their dependencies were completed (*premature execution*).
-* **Root Cause:** Lack of proper synchronization in async runtime processing.
+* **Root Cause:** Lack of proper completion synchronization in the async runtime.
 * **Fix Applied:**
   * Introduced centralized `state_map` for state tracking.
   * Added explicit `notify` mechanisms.
-  * Implemented rigorous dependency resolution logic.
+  * Redesigned dependency resolution logic.
 * **Result:** Achieved strict DAG execution order guarantee.
 
 ---
@@ -126,9 +119,8 @@ This eliminates race conditions and premature execution ("flying execution").
 
 Run the following commands in VS Code integrated terminal (PowerShell):
 
-```powershell
 # 1. Clone repository
-git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
+git clone https://github.com/kyo38/ninja.git
 cd ninja
 
 # 2. Start Master node
@@ -139,13 +131,12 @@ cargo run --bin worker
 
 # 4. Submit tasks via Client
 cargo run --bin client
-```
 
 ---
 
 ## ■ Parallel Execution
 
-- Running multiple Worker processes enables parallel processing.
+- Running multiple Worker processes enables automatic parallel processing.
 - Independent tasks in the DAG execute concurrently across available Workers.
 
 ---
@@ -179,5 +170,5 @@ cargo run --bin client
 ## ■ Project Purpose
 
 - Deepen understanding of asynchronous distributed system architecture.
-- Build a robust, production-grade DAG task execution model in Rust.
+- Build a robust DAG task execution model in Rust.
 - Enhance systems engineering and concurrency design skills.
