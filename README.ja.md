@@ -133,6 +133,8 @@ cargo run --bin worker
 # 4. Clientからタスク投入
 cargo run --bin client
 
+> **注記:** Masterノードを安全にシャットダウンするには、Master側のターミナル画面で `Ctrl + Q` を入力してください。
+
 ---
 
 ## ■ 並列実行確認

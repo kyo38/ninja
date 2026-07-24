@@ -132,6 +132,8 @@ cargo run --bin worker
 # 4. Submit tasks via Client
 cargo run --bin client
 
+> **Note:** To shut down the Master node safely, press `Ctrl + Q` in the Master terminal.
+
 ---
 
 ## ■ Parallel Execution
