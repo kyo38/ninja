@@ -57,21 +57,21 @@
 
 ## ■ アーキテクチャ
 
-    +---------+
-    | Client  |
-    +----+----+
-         | (Port 9090)
-         v
-    +----+----+
-    | Master  | (Orchestrator)
-    +----+----+
-         | (Port 9001)
-  +------+------+
-  |      |      |
-  v      v      v
-+---+  +---+  +---+
-| W |  | W |  | W |  (Workers)
-+---+  +---+  +---+
+         +---------+
+         | Client  |
+         +----+----+
+              | (Port 9090)
+              v
+         +----+----+
+         | Master  | (Orchestrator)
+         +----+----+
+              | (Port 9001)
+   +----------+----------+
+   |          |          |
+   v          v          v
++--------+ +--------+ +--------+
+| Worker | | Worker | | Worker |
++--------+ +--------+ +--------+
 
 ### 通信プロトコル
 - **Client → Master (Port 9090)**: DAGタスク定義の投入
@@ -82,14 +82,14 @@
 
 ## ■ タスク定義（例）
 
-    {
-      "tasks": [
-        { "id": "A", "deps": [] },
-        { "id": "B", "deps": [] },
-        { "id": "C", "deps": ["A"] },
-        { "id": "D", "deps": ["B", "C"] }
-      ]
-    }
+{
+  "tasks": [
+    { "id": "A", "deps": [] },
+    { "id": "B", "deps": [] },
+    { "id": "C", "deps": ["A"] },
+    { "id": "D", "deps": ["B", "C"] }
+  ]
+}
 
 ---
 
@@ -97,15 +97,14 @@
 
 VS Code 上の統合ターミナル（PowerShell）で以下の手順を実行します。
 
-    # 1. リポジトリを取得
-    git clone https://github.com/kyo38/ninja.git
-    cd ninja
+git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
+cd ninja
 
-    # 2. Master (Orchestrator) を起動
-    cargo run --bin ninja
+# Master (Orchestrator) を起動
+cargo run --bin ninja
 
-    # 3. Worker を起動 (複数のターミナルを開いて起動可能)
-    cargo run --bin worker
+# Worker を起動 (複数のターミナルを開いて起動可能)
+cargo run --bin worker
 
 > **注記:** Master ノードおよび Worker ノードを安全にシャットダウンするには、それぞれのターミナル画面で `q` を入力して `Enter` を押してください。詳細なデバッグログを表示する場合は `$env:RUST_LOG="debug"` を設定して実行します。
 
