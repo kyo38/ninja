@@ -12,36 +12,37 @@ Distributed DAG Execution Engine (Experimental)
 
 This project is an experimental distributed execution engine based on **DAG (Directed Acyclic Graph)** task dependencies, developed specifically for Windows 11 environments using Rust and Tokio.
 
-It focuses on solving the "execution order guarantee problem" in asynchronous environments by combining dependency resolution and state synchronization.
+It focuses on solving the "execution order guarantee problem" and ensuring network resilience in asynchronous environments through structured state synchronization, automatic reconnections, and heartbeat death detection.
 
 ---
 
 ## ■ Key Technical Highlights
 
-This system ensures strict execution order in an asynchronous distributed environment using:
-- **`state_map`**: For real-time task state tracking and management.
-- **`notify` mechanism**: For explicit completion signaling and execution control.
-
-This eliminates race conditions and premature execution ("flying execution").
+This system ensures strict execution order and high availability in an asynchronous distributed environment using:
+- **`thiserror` Integration**: Centralized, type-safe error handling across network and system layers.
+- **Exponential Backoff Reconnections**: Automatic retry with exponential backoff on connection failure.
+- **Bi-directional Heartbeat (PING/PONG)**: Proactive 5-second PINGs with 15-second timeout monitoring for silent disconnect detection.
+- **Task Execution Timed-outs**: Isolated task cancellation using Tokio timeouts.
 
 ---
 
 ## ■ Current Status
 
-* **Phase 1: Completed**
-  * DAG execution ordering ✔
-  * Async bug fix ✔
-  * Core execution flow ✔
-* **Phase 2: In Progress**
-  * Retry mechanism (Pending)
-  * Timeout control (Pending)
-  * Parallelism control (Testing)
-* **Phase 3: Planned**
-  * Distributed scheduling
-  * Auto-scaling workers
-* **Phase 4: Planned**
-  * Security
-  * Authentication / Authorization
+* **Phase 1 to 3: Completed**
+  * Core DAG execution ordering ✔
+  * Modular architecture refactoring ✔
+  * Graceful shutdown with `q` key monitoring ✔
+* **Phase 4: Completed (Resilience & Error Handling)**
+  * Custom type-safe error base (`thiserror`) ✔
+  * Worker auto-reconnect with exponential backoff ✔
+  * Bi-directional PING/PONG heartbeat & 15s timeout monitoring ✔
+* **Phase 5: Planned (Type-Safe Protocol & DAG Scheduler)**
+  * Binary protocol serialization (`serde` / `bincode`)
+  * Topological sorting & in-degree DAG scheduler
+* **Phase 6: Planned (Distributed State & Multi-Worker Control)**
+  * Worker pool management & failover re-assignment
+* **Phase 7: Planned (Client CLI & E2E Testing)**
+  * YAML/JSON DAG parser & end-to-end integration tests
 
 ---
 
@@ -55,34 +56,31 @@ This eliminates race conditions and premature execution ("flying execution").
 
 ## ■ Architecture
 
-```text
          +---------+
          | Client  |
          +----+----+
-              |
+              | (Port 9090)
               v
          +----+----+
-         | Master  |
+         | Master  | (Orchestrator)
          +----+----+
-              |
+              | (Port 9001)
    +----------+----------+
    |          |          |
    v          v          v
 +--------+ +--------+ +--------+
 | Worker | | Worker | | Worker |
 +--------+ +--------+ +--------+
-```
 
 ### Communication Protocol
-- **Client → Master**: Submit DAG tasks and definitions
-- **Master → Worker**: Assign executable tasks
-- **Worker → Master**: Notify execution completion
+- **Client → Master (Port 9090)**: Submit DAG tasks and definitions.
+- **Master → Worker (Port 9001)**: Assign executable tasks and exchange heartbeats (`PING`/`PONG`).
+- **Worker → Master**: Notify task execution results and status.
 
 ---
 
 ## ■ Task Definition Example
 
-```json
 {
   "tasks": [
     { "id": "A", "deps": [] },
@@ -91,31 +89,6 @@ This eliminates race conditions and premature execution ("flying execution").
     { "id": "D", "deps": ["B", "C"] }
   ]
 }
-```
-
----
-
-## ■ Execution Model & Lifecycle
-
-1. **Master** manages all task definitions and global DAG state.
-2. Dependencies are dynamically resolved.
-3. Only executable tasks (with all dependencies met) are assigned to **Workers**.
-4. **Workers** execute tasks asynchronously.
-5. Worker state transitions: `Idle` → `Assigned` → `Running` → `Completed` → `Notify`.
-6. Completion is notified back to Master.
-7. `state_map` updates unlock the next dependent tasks.
-
----
-
-## ■ Async Bug & Technical Resolution
-
-* **Problem:** Tasks were executed before their dependencies were completed (*premature execution*).
-* **Root Cause:** Lack of proper completion synchronization in the async runtime.
-* **Fix Applied:**
-  * Introduced centralized `state_map` for state tracking.
-  * Added explicit `notify` mechanisms.
-  * Redesigned dependency resolution logic.
-* **Result:** Achieved strict DAG execution order guarantee.
 
 ---
 
@@ -123,46 +96,31 @@ This eliminates race conditions and premature execution ("flying execution").
 
 Run the following commands in VS Code integrated terminal (PowerShell):
 
-```powershell
 # 1. Clone repository
 git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
 cd ninja
 
-# 2. Start Master node
-cargo run --bin master
+# 2. Start Master node (Orchestrator)
+cargo run --bin ninja
 
 # 3. Start Workers (Open multiple terminals to enable parallelism)
 cargo run --bin worker
 
-# 4. Submit tasks via Client
-cargo run --bin client
-```
-
-> **Note:** To shut down the Master and Worker nodes safely, type `q` and press `Enter` in their respective terminals.
-
----
-
-## ■ Parallel Execution
-
-- Running multiple Worker processes enables automatic parallel processing.
-- Independent tasks in the DAG execute concurrently across available Workers.
+Note: To shut down the Master and Worker nodes safely, type `q` and press `Enter` in their respective terminals. Debug logs can be enabled using `$env:RUST_LOG="debug"`.
 
 ---
 
 ## ■ Roadmap
 
-* **Phase 2 (Reliability):**
-  * Retry mechanism
-  * Timeout control
-  * Concurrency limits
-* **Phase 3 (Scalability):**
-  * Distributed scheduling
-  * Sharding
-  * Queue optimization
-* **Phase 4 (Security):**
-  * Authentication (Auth)
-  * Authorization (RBAC)
-  * Secure communication
+* **Phase 5 (Type-Safe Protocol & Distributed Scheduler):**
+  * Binary frame protocol (`bincode` / `serde`)
+  * Topological sorting & in-degree DAG scheduler
+* **Phase 6 (Distributed State & Multi-Worker Optimization):**
+  * Worker pool manager (`WorkerManager`)
+  * Parallel load balancing & failover re-assignment
+* **Phase 7 (Client CLI & E2E Testing):**
+  * YAML/JSON DAG definition parser
+  * Complete E2E pipeline validation
 
 ---
 
