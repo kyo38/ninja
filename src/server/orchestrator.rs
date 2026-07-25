@@ -1,149 +1,253 @@
 // src/server/orchestrator.rs
 
-use std::error::Error;
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify};
+use tokio::time::{sleep, Duration};
+use tracing::{error, info, warn};
 
-use crate::core::graph::{Task, DagScheduler, TaskState}; // 👈 ninja:: から crate:: へ修正
-use super::worker_pool::WorkerPool;
-use super::client_handler::ClientHandler;
+use crate::core::config::Config;
+use crate::core::graph::{DagScheduler, Task, TaskState};
+use crate::core::worker::WorkerRegistry;
+use crate::server::client_handler::ClientHandler;
+use crate::server::worker_pool::WorkerPool;
 
 pub struct Orchestrator {
-    worker_addr: String,
-    client_addr: String,
-    state_map: Arc<Mutex<HashMap<String, TaskState>>>,
-    task_lookup: Arc<Mutex<HashMap<String, Task>>>,
+    config: Config,
+    worker_pool: Arc<WorkerPool>,
+    worker_registry: Arc<WorkerRegistry>,
+    task_queue: Arc<Mutex<Vec<Task>>>,
     pulse: Arc<Notify>,
 }
 
 impl Orchestrator {
-    pub fn new(worker_addr: &str, client_addr: &str) -> Self {
+    pub fn from_config(config: Config) -> Self {
+        let pulse = Arc::new(Notify::new());
+        let worker_pool = Arc::new(WorkerPool::new(Arc::clone(&pulse)));
+        let worker_registry = Arc::new(WorkerRegistry::new(vec![config.worker_addr.clone()]));
+
         Self {
-            worker_addr: worker_addr.to_string(),
-            client_addr: client_addr.to_string(),
-            state_map: Arc::new(Mutex::new(HashMap::new())),
-            task_lookup: Arc::new(Mutex::new(HashMap::new())),
-            pulse: Arc::new(Notify::new()),
+            config,
+            worker_pool,
+            worker_registry,
+            task_queue: Arc::new(Mutex::new(Vec::new())),
+            pulse,
+        }
+    }
+
+    pub fn new(
+        config: Config,
+        worker_pool: Arc<WorkerPool>,
+        worker_registry: Arc<WorkerRegistry>,
+        pulse: Arc<Notify>,
+    ) -> Self {
+        Self {
+            config,
+            worker_pool,
+            worker_registry,
+            task_queue: Arc::new(Mutex::new(Vec::new())),
+            pulse,
         }
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn Error>> {
-        let worker_pool = WorkerPool::new(Arc::clone(&self.pulse));
-        worker_pool.start_listener(&self.worker_addr).await?;
+        // 0. WorkerRegistry のヘルスチェック
+        self.worker_registry
+            .start_heartbeat_loop(Duration::from_secs(5))
+            .await;
 
-        let mut client_handler = ClientHandler::bind(&self.client_addr).await?;
+        // 1. Worker 接続リスナー
+        let wp = Arc::clone(&self.worker_pool);
+        let worker_addr = self.config.worker_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = wp.start_listener(&worker_addr).await {
+                error!("❌ [Master] WorkerPool エラー: {:?}", e);
+            }
+        });
+
+        // 2. Client タスク受信リスナー
+        let client_addr = self.config.client_addr.clone();
+        let tq_client = Arc::clone(&self.task_queue);
+        let pulse_client = Arc::clone(&self.pulse);
+
+        tokio::spawn(async move {
+            match ClientHandler::bind(&client_addr).await {
+                Ok(mut handler) => loop {
+                    match handler.accept_tasks().await {
+                        Ok(new_tasks) => {
+                            let mut queue = tq_client.lock().await;
+                            queue.extend(new_tasks);
+                            info!("🚀 [Master] 新しい DAG タスク群をキューに追加しました。");
+                            pulse_client.notify_waiters();
+                        }
+                        Err(e) => {
+                            error!("❌ [Master] クライアントタスク受信エラー: {:?}", e);
+                            sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("❌ [Master] ClientHandler バインドエラー: {:?}", e);
+                }
+            }
+        });
+
+        // 3. DAG スケジューラーループ
+        let tq_sched = Arc::clone(&self.task_queue);
+        let registry_sched = Arc::clone(&self.worker_registry);
+        let pulse_sched = Arc::clone(&self.pulse);
+        let wp_sched = Arc::clone(&self.worker_pool);
+
+        tokio::spawn(async move {
+            Self::schedule_loop(tq_sched, registry_sched, pulse_sched, wp_sched).await;
+        });
+
+        info!("💡 終了するには 'q' を入力して Enter を押すか、Ctrl + C を押してください。");
+
+        // 4. シャットダウン監視
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 1024];
 
         loop {
-            match client_handler.accept_tasks().await {
-                Ok(tasks) => {
-                    self.execute_dag(tasks, &worker_pool).await?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("🛑 [Master] Ctrl+C を検知しました。Orchestrator をシャットダウンします...");
+                    break;
                 }
-                Err(e) => {
-                    eprintln!("❌ [Master] Client通信/パースエラー: {:?}", e);
+                res = stdin.read(&mut buf) => {
+                    match res {
+                        Ok(n) if n > 0 => {
+                            let input = String::from_utf8_lossy(&buf[..n]);
+                            if input.trim().eq_ignore_ascii_case("q") {
+                                info!("🛑 [Master] 'q' キー入力を検知しました。Orchestrator をシャットダウンします...");
+                                break;
+                            }
+                        }
+                        _ => {
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 
-    async fn execute_dag(&self, tasks: Vec<Task>, worker_pool: &WorkerPool) -> Result<(), Box<dyn Error>> {
-        {
-            let mut s_map = self.state_map.lock().await;
-            let mut t_map = self.task_lookup.lock().await;
-            s_map.clear();
-            t_map.clear();
-            for task in tasks.iter() {
-                t_map.insert(task.name.clone(), task.clone());
-                s_map.insert(task.name.clone(), TaskState::Pending);
-            }
-        }
-
-        let scheduler = match DagScheduler::new(tasks) {
-            Ok(sched) => sched,
-            Err(e) => {
-                eprintln!("❌ [Master] DAGの初期化に失敗: {:?}", e);
-                return Ok(());
-            }
-        };
-
-        println!("\n--- 🚀 分散 DAG 実行スケジュール開始 ---");
-
-        let workers = worker_pool.get_inner();
+    async fn schedule_loop(
+        task_queue: Arc<Mutex<Vec<Task>>>,
+        registry: Arc<WorkerRegistry>,
+        pulse: Arc<Notify>,
+        worker_pool: Arc<WorkerPool>,
+    ) {
+        let mut task_states: HashMap<String, TaskState> = HashMap::new();
+        let mut scheduler: Option<DagScheduler> = None;
+        let completed_tasks = Arc::new(Mutex::new(Vec::<(String, bool)>::new())); // (TaskName, SuccessFlag)
 
         loop {
-            let current_states = self.state_map.lock().await.clone();
+            let _ = tokio::time::timeout(Duration::from_millis(200), pulse.notified()).await;
 
-            let all_finished = current_states.values().all(|s| {
-                matches!(s, TaskState::Success | TaskState::Failed)
-            });
-
-            if all_finished {
-                println!("🎉 全ての分散タスクの実行が完了しました！");
-                break;
-            }
-
-            let ready_tasks = scheduler.get_ready_tasks(&current_states);
-            let mut worker_list = workers.lock().await;
-
-            if !ready_tasks.is_empty() && !worker_list.is_empty() {
-                for task_name in ready_tasks {
-                    if let Some(mut worker) = worker_list.pop() {
-                        let task_lookup_map = self.task_lookup.lock().await;
-                        if let Some(task) = task_lookup_map.get(&task_name) {
-                            
-                            if let Some(state) = self.state_map.lock().await.get_mut(&task_name) {
-                                *state = TaskState::Running;
-                            }
-
-                            println!("✈️  [Master] Worker {} へタスク [{}] を配信します: {}", worker.id, task.name, task.command);
-
-                            let state_map_inner = Arc::clone(&self.state_map);
-                            let workers_inner = Arc::clone(&workers);
-                            let pulse_inner = Arc::clone(&self.pulse);
-                            let t_name = task.name.clone();
-                            let cmd_str = task.command.clone();
-
-                            tokio::spawn(async move {
-                                if worker.stream.write_all(cmd_str.as_bytes()).await.is_ok() {
-                                    let mut res_buf = vec![0; 1024];
-                                    if let Ok(bytes_read) = worker.stream.read(&mut res_buf).await {
-                                        let response = String::from_utf8_lossy(&res_buf[..bytes_read]);
-                                        let mut s_map = state_map_inner.lock().await;
-                                        if let Some(state) = s_map.get_mut(&t_name) {
-                                            if response.trim() == "SUCCESS" {
-                                                println!("✓ [Master] Worker {} から報告: [{}] 正常終了", worker.id, t_name);
-                                                *state = TaskState::Success;
-                                            } else {
-                                                println!("❌ [Master] Worker {} から報告: [{}] エラー終了", worker.id, t_name);
-                                                *state = TaskState::Failed;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    println!("⚠️  [Master] Worker {} との通信に失敗。タスク [{}] を保留に戻します", worker.id, t_name);
-                                    if let Some(state) = state_map_inner.lock().await.get_mut(&t_name) {
-                                        *state = TaskState::Pending;
-                                    }
-                                }
-
-                                workers_inner.lock().await.push(worker);
-                                pulse_inner.notify_waiters();
-                            });
-                        } else {
-                            worker_list.push(worker);
-                        }
+            // 完了したタスクの状態反映
+            {
+                let mut done_list = completed_tasks.lock().await;
+                for (task_name, is_success) in done_list.drain(..) {
+                    if is_success {
+                        task_states.insert(task_name, TaskState::Success);
                     } else {
-                        break;
+                        task_states.insert(task_name, TaskState::Failed);
                     }
                 }
             }
 
-            drop(worker_list);
-            self.pulse.notified().await;
-        }
+            let mut tasks = task_queue.lock().await;
+            if tasks.is_empty() {
+                continue;
+            }
 
-        println!("--- 🏁 分散 DAG 実行スケジュール終了 ---\n");
-        Ok(())
+            if scheduler.is_none() {
+                match DagScheduler::new(tasks.clone()) {
+                    Ok(sched) => {
+                        info!("⚙️  [Master] DAG スケジューラーを初期化しました。");
+                        for t in tasks.iter() {
+                            task_states.insert(t.name.clone(), TaskState::Pending);
+                        }
+                        scheduler = Some(sched);
+                    }
+                    Err(e) => {
+                        error!("❌ [Master] DAG 構築エラー: {}", e);
+                        tasks.clear();
+                        continue;
+                    }
+                }
+            }
+
+            let sched = scheduler.as_ref().unwrap();
+            let ready_tasks = sched.get_ready_tasks(&task_states);
+
+            if ready_tasks.is_empty() {
+                let all_finished = !task_states.is_empty()
+                    && task_states.values().all(|s| matches!(s, TaskState::Success | TaskState::Failed));
+
+                if all_finished {
+                    info!("🎉 [Master] すべての DAG タスクの実行が完了しました！");
+                    tasks.clear();
+                    task_states.clear();
+                    scheduler = None;
+                }
+                continue;
+            }
+
+            for task_name in ready_tasks {
+                let sessions = registry.get_cloned_sessions().await;
+                let target_worker = sessions.iter().find(|w| w.is_alive).map(|w| w.address.clone());
+
+                if let Some(worker_addr) = target_worker {
+                    if let Some(task) = tasks.iter().find(|t| t.name == task_name).cloned() {
+                        if registry.acquire(&worker_addr).await.is_ok() {
+                            info!(
+                                "✈️  [Master] タスク [{}] を Worker ({}) に割り当てます (コマンド: '{}')",
+                                task.name, worker_addr, task.command
+                            );
+
+                            task_states.insert(task.name.clone(), TaskState::Running { worker_id: 1 });
+
+                            let registry_clone = Arc::clone(&registry);
+                            let pulse_clone = Arc::clone(&pulse);
+                            let completed_tasks_clone = Arc::clone(&completed_tasks);
+                            let wp_clone = Arc::clone(&worker_pool);
+                            let name_clone = task.name.clone();
+                            let cmd_clone = task.command.clone();
+
+                            // 実際の TcpStream 経由で Worker へ送信してレスポンスを待つ
+                            tokio::spawn(async move {
+                                let is_success = match wp_clone.send_command(&cmd_clone).await {
+                                    Ok(res) => {
+                                        info!("✓ [Master] タスク [{}] 実行完了。応答: {}", name_clone, res);
+                                        true
+                                    }
+                                    Err(e) => {
+                                        error!("❌ [Master] タスク [{}] 実行失敗: {:?}", name_clone, e);
+                                        false
+                                    }
+                                };
+
+                                {
+                                    let mut done = completed_tasks_clone.lock().await;
+                                    done.push((name_clone, is_success));
+                                }
+
+                                registry_clone.release(&worker_addr).await;
+                                pulse_clone.notify_waiters();
+                            });
+                        }
+                    }
+                } else {
+                    warn!("⚠️  [Master] 割り当て可能な Worker がありません。リトライを待機します。");
+                    break;
+                }
+            }
+        }
     }
 }
