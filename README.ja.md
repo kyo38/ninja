@@ -56,23 +56,21 @@ DAGベース実行と状態同期メカニズムにより、非同期環境で�
 
 ## ■ アーキテクチャ
 
-```text
-          +---------+
-          | Client  |
-          +----+----+
-               |
-               v
-          +----+----+
-          | Master  |
-          +----+----+
-               |
+         +---------+
+         | Client  |
+         +----+----+
+              |
+              v
+         +----+----+
+         | Master  |
+         +----+----+
+              |
    +-----------+-----------+
    |           |           |
    v           v           v
- +--------+  +--------+  +--------+
- | Worker |  | Worker |  | Worker |
- +--------+  +--------+  +--------+
-```
++--------+  +--------+  +--------+
+| Worker |  | Worker |  | Worker |
++--------+  +--------+  +--------+
 
 ### 通信プロトコル
 - **Client → Master**: タスク定義・DAG投入
@@ -83,7 +81,6 @@ DAGベース実行と状態同期メカニズムにより、非同期環境で�
 
 ## ■ タスク定義（例）
 
-```json
 {
   "tasks": [
     { "id": "A", "deps": [] },
@@ -92,7 +89,6 @@ DAGベース実行と状態同期メカニズムにより、非同期環境で�
     { "id": "D", "deps": ["B", "C"] }
   ]
 }
-```
 
 ---
 
@@ -124,9 +120,8 @@ DAGベース実行と状態同期メカニズムにより、非同期環境で�
 
 VS Code上の統合ターミナル（PowerShell）で以下の手順を実行します。
 
-```powershell
 # 1. リポジトリを取得
-git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
+git clone https://github.com/kyo38/ninja.git
 cd ninja
 
 # 2. Masterを起動
@@ -137,7 +132,6 @@ cargo run --bin worker
 
 # 4. Clientからタスク投入
 cargo run --bin client
-```
 
 > **注記:** Masterノードを安全にシャットダウンするには、Master側のターミナル画面で `Ctrl + Q` を入力してください。
 

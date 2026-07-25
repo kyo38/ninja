@@ -55,23 +55,21 @@ This eliminates race conditions and premature execution ("flying execution").
 
 ## ■ Architecture
 
-```text
-          +---------+
-          | Client  |
-          +----+----+
-               |
-               v
-          +----+----+
-          | Master  |
-          +----+----+
-               |
+         +---------+
+         | Client  |
+         +----+----+
+              |
+              v
+         +----+----+
+         | Master  |
+         +----+----+
+              |
    +-----------+-----------+
    |           |           |
    v           v           v
- +--------+  +--------+  +--------+
- | Worker |  | Worker |  | Worker |
- +--------+  +--------+  +--------+
-```
++--------+  +--------+  +--------+
+| Worker |  | Worker |  | Worker |
++--------+  +--------+  +--------+
 
 ### Communication Protocol
 - **Client → Master**: Submit DAG tasks and definitions
@@ -82,7 +80,6 @@ This eliminates race conditions and premature execution ("flying execution").
 
 ## ■ Task Definition Example
 
-```json
 {
   "tasks": [
     { "id": "A", "deps": [] },
@@ -91,7 +88,6 @@ This eliminates race conditions and premature execution ("flying execution").
     { "id": "D", "deps": ["B", "C"] }
   ]
 }
-```
 
 ---
 
@@ -123,9 +119,8 @@ This eliminates race conditions and premature execution ("flying execution").
 
 Run the following commands in VS Code integrated terminal (PowerShell):
 
-```powershell
 # 1. Clone repository
-git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
+git clone https://github.com/kyo38/ninja.git
 cd ninja
 
 # 2. Start Master node
@@ -136,7 +131,6 @@ cargo run --bin worker
 
 # 4. Submit tasks via Client
 cargo run --bin client
-```
 
 > **Note:** To shut down the Master node safely, press `Ctrl + Q` in the Master terminal.
 
