@@ -56,21 +56,23 @@ This system ensures strict execution order and high availability in an asynchron
 
 ## ■ Architecture
 
-         +---------+
-         | Client  |
-         +----+----+
-              | (Port 9090)
-              v
-         +----+----+
-         | Master  | (Orchestrator)
-         +----+----+
-              | (Port 9001)
-   +----------+----------+
-   |          |          |
-   v          v          v
-+--------+ +--------+ +--------+
-| Worker | | Worker | | Worker |
-+--------+ +--------+ +--------+
+```text
+     +---------+
+     | Client  |
+     +----+----+
+          | (Port 9090)
+          v
+     +----+----+
+     | Master  | (Orchestrator)
+     +----+----+
+          | (Port 9001)
+  +-------+-------+
+  |       |       |
+  v       v       v
++---+   +---+   +---+
+| W |   | W |   | W |  (Workers)
++---+   +---+   +---+
+```
 
 ### Communication Protocol
 - **Client → Master (Port 9090)**: Submit DAG tasks and definitions.
@@ -81,6 +83,7 @@ This system ensures strict execution order and high availability in an asynchron
 
 ## ■ Task Definition Example
 
+```json
 {
   "tasks": [
     { "id": "A", "deps": [] },
@@ -89,6 +92,7 @@ This system ensures strict execution order and high availability in an asynchron
     { "id": "D", "deps": ["B", "C"] }
   ]
 }
+```
 
 ---
 
@@ -96,14 +100,17 @@ This system ensures strict execution order and high availability in an asynchron
 
 Run the following commands in VS Code integrated terminal (PowerShell):
 
-git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
+```powershell
+# 1. Clone repository
+git clone https://github.com/kyo38/ninja.git
 cd ninja
 
-# Start Master node (Orchestrator)
+# 2. Start Master node (Orchestrator)
 cargo run --bin ninja
 
-# Start Workers (Open multiple terminals to enable parallelism)
+# 3. Start Workers (Open multiple terminals to enable parallelism)
 cargo run --bin worker
+```
 
 > **Note:** To shut down the Master and Worker nodes safely, type `q` and press `Enter` in their respective terminals. Debug logs can be enabled using `$env:RUST_LOG="debug"`.
 
