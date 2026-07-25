@@ -139,7 +139,7 @@ cargo run --bin worker
 cargo run --bin client
 ```
 
-> **注記:** Masterノードを安全にシャットダウンするには、Master側のターミナル画面で `Ctrl + Q` を入力してください。
+> **注記:** Masterノードを安全にシャットダウンするには、Master側のターミナル画面で `q` を入力して `Enter` を押してください。
 
 ---
 

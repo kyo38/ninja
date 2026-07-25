@@ -138,7 +138,7 @@ cargo run --bin worker
 cargo run --bin client
 ```
 
-> **Note:** To shut down the Master node safely, press `Ctrl + Q` in the Master terminal.
+> **Note:** To shut down the Master node safely, type `q` and press `Enter` in the Master terminal.
 
 ---
 
