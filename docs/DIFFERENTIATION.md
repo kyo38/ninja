@@ -1,16 +1,57 @@
-# Scion → Ninja: Positioning & Technical Differentiation
+# Differentiation & Technical Positioning
 
-This document outlines the architectural positioning and key differentiators of `ninja` compared to major existing distributed execution engines and workflow orchestrators (Apache Airflow, Ray, and Kubernetes Jobs).
+## Problem
+
+Existing distributed task systems such as Airflow, Ray, and Kubernetes Jobs are powerful, but often introduce significant operational complexity, heavy dependencies, and high runtime overhead—making them less suitable for lightweight, experimental, or secure environments.
+
+## Approach
+
+**Ninja** is designed as a:
+
+- **Lightweight**
+- **Rust-based**
+- **Distributed DAG execution engine**
+
+with a sharp focus on simplicity, strict execution control, and extensibility.
 
 ---
 
-## 1. Design Philosophy
+## Architecture Overview
 
-`ninja` is engineered specifically as a **lightweight, sub-millisecond, single-binary distributed DAG execution engine**. It eliminates the need for heavy infrastructure overhead, external databases, or complex setup procedures, making it ideal for Windows 11, local development, edge node, and air-gapped environments.
+```text
+                 +-------------------+
+                 | Web Browser / UI  | (Port 8080)
+                 +---------+---------+
+                           | (HTTP / JSON API)
+     +---------+           v           +---------+
+     | Client  | ----> +-------+ <---- | Workers |
+     +---------+       |Master |       +---------+
+    (Port 9090)        +-------+       (Port 9001)
+ (Submit DAG Tasks)  (Orchestrator)  (Execute Tasks & Heartbeat)
+```
 
 ---
 
-## 2. Comparison Matrix
+## Key Differences
+
+### 1. Lightweight by Design
+No heavy external dependencies (no databases like PostgreSQL required) and minimal runtime overhead. Built in Rust with a memory footprint of just a few megabytes.
+
+### 2. DAG-first Execution Model
+Explicit dependency resolution with dynamic topological sorting and in-degree scheduling for exact execution order guarantees.
+
+### 3. True Distributed Orchestration
+Centralized master orchestrator with dynamic worker pool management, bi-directional 12-second PING/PONG heartbeat detection, and automatic task re-queuing on worker failure.
+
+### 4. Observability Built-in
+Structured tracing context (`tracing::span`) across asynchronous task dispatches, paired with an embedded real-time Axum Web Dashboard.
+
+### 5. Extensibility
+Plugin-ready architecture supporting external task definitions (JSON / YAML / TOML) and native OS process execution without runtime binding constraints.
+
+---
+
+## Comparison Matrix
 
 | Aspect | Apache Airflow | Ray | Kubernetes Jobs | **Scion → Ninja** |
 | :--- | :--- | :--- | :--- | :--- |
@@ -23,19 +64,10 @@ This document outlines the architectural positioning and key differentiators of 
 
 ---
 
-## 3. Core Value Propositions
+## Positioning
 
-### ① Zero External Dependencies & Low Footprint
-No external database, container runtime, or Python interpreter is required. Built entirely in Rust, `ninja` operates as a single executable with a memory footprint of just a few megabytes.
+Ninja is not a replacement for large-scale enterprise orchestration platforms, but a complementary system optimized for:
 
-### ② Sub-millisecond Dispatching for Local & Air-Gapped Environments
-In environments where deploying Kubernetes or cloud infrastructure is impractical—such as factory networks, edge computing nodes, or isolated Windows 11 setups—`ninja` guarantees strict execution ordering with sub-millisecond task dispatching.
-
-### ③ Language-Agnostic Process Orchestration
-Unlike Python-bound frameworks, `ninja` seamlessly orchestrates native OS binaries, scripts, and commands as nodes in a DAG without runtime binding constraints.
-
----
-
-## 4. Elevator Pitch
-
-> "A single-binary, Rust-based distributed DAG scheduler designed for local, edge, and air-gapped environments that demand strict execution ordering, sub-millisecond dispatching, bi-directional heartbeat detection, and dynamic failover—without the infrastructure overhead of Airflow or Kubernetes."
+- **Research & Experimental Environments**: Rapid prototyping of asynchronous distributed system algorithms.
+- **Secure & Air-gapped Systems**: Standalone execution in factory networks or isolated Windows 11 / Linux edge nodes.
+- **Embedded Execution Engines**: Embedding high-speed, sub-millisecond DAG scheduling directly into systems engineering toolchains.
