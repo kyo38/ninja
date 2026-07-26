@@ -1,121 +1,97 @@
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use serde::{Serialize, Deserialize};
-use tracing::error;
+use tracing::info;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TaskSpec {
-    pub task_id: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub dependencies: Vec<String>,
-}
+use crate::server::orchestrator::{MasterToWorkerMsg, WorkerToMasterMsg, TaskResult};
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TaskResult {
-    pub task_id: String,
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum MasterToWorkerMsg {
-    AssignTask(TaskSpec),
-    Ping,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum WorkerToMasterMsg {
-    Register { worker_id: String },
-    Heartbeat { worker_id: String },
-    TaskFinished(TaskResult),
-}
-
-pub struct Worker {
+pub struct WorkerNode {
     worker_id: String,
-    target_addr: String,
+    server_addr: String,
 }
 
-/// 外部コードの `WorkerNode` 参照用エイリアス
-pub type WorkerNode = Worker;
-
-impl Worker {
-    /// &str と String のどちらの型でも直接渡せるように impl Into<String> を採用
-    pub fn new(worker_id: impl Into<String>, target_addr: impl Into<String>) -> Self {
+impl WorkerNode {
+    pub fn new(worker_id: impl Into<String>, server_addr: impl Into<String>) -> Self {
         Self {
             worker_id: worker_id.into(),
-            target_addr: target_addr.into(),
+            server_addr: server_addr.into(),
         }
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        println!("Starting Ninja Worker [{}] -> target: {}", self.worker_id, self.target_addr);
-        println!("💡 終了するには 'q' を入力して Enter を押すか、Ctrl + C を押してください。");
+        info!("🔌 [Worker] Master ({}) に接続を試みています...", self.server_addr);
+        let stream = TcpStream::connect(&self.server_addr).await?;
+        info!("✅ [Worker] Master への接続に成功しました！");
 
-        let socket = TcpStream::connect(&self.target_addr).await?;
-        let (mut rd, mut wr) = socket.into_split();
+        // wr は Mutex に入れるため mut は不要です
+        let (mut rd, wr) = stream.into_split();
+        let wr = Arc::new(tokio::sync::Mutex::new(wr));
 
-        // 登録メッセージの送信
-        let reg_msg = WorkerToMasterMsg::Register { worker_id: self.worker_id.clone() };
-        let bytes = serde_json::to_vec(&reg_msg)?;
-        let len = (bytes.len() as u32).to_be_bytes();
-        wr.write_all(&len).await?;
-        wr.write_all(&bytes).await?;
+        // 1. 登録メッセージの送信
+        let reg_msg = WorkerToMasterMsg::Register {
+            worker_id: self.worker_id.clone(),
+        };
+        Self::send_msg(&wr, &reg_msg).await?;
 
-        // ハートビート送信タスク
-        let worker_id_clone = self.worker_id.clone();
-        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<WorkerToMasterMsg>(8);
+        // 2. ハートビート送信タスクの起動 (5秒間隔)
+        let wr_hb = wr.clone();
+        let worker_id_hb = self.worker_id.clone();
         tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                let hb = WorkerToMasterMsg::Heartbeat { worker_id: worker_id_clone.clone() };
-                if hb_tx.send(hb).await.is_err() { break; }
-            }
-        });
-
-        // メッセージ受信用チャンネル
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<WorkerToMasterMsg>(32);
-
-        // 送信ループ処理
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(msg) = hb_rx.recv() => {
-                        if let Ok(bytes) = serde_json::to_vec(&msg) {
-                            let len = (bytes.len() as u32).to_be_bytes();
-                            if wr.write_all(&len).await.is_err() { break; }
-                            if wr.write_all(&bytes).await.is_err() { break; }
-                        }
-                    }
-                    Some(msg) = rx.recv() => {
-                        if let Ok(bytes) = serde_json::to_vec(&msg) {
-                            let len = (bytes.len() as u32).to_be_bytes();
-                            if wr.write_all(&len).await.is_err() { break; }
-                            if wr.write_all(&bytes).await.is_err() { break; }
-                        }
-                    }
+                interval.tick().await;
+                let hb_msg = WorkerToMasterMsg::Heartbeat {
+                    worker_id: worker_id_hb.clone(),
+                };
+                if Self::send_msg(&wr_hb, &hb_msg).await.is_err() {
+                    break;
                 }
             }
         });
 
-        // 受信ループ処理
+        // 3. Masterからのタスク受信ループ
         let mut len_buf = [0u8; 4];
         loop {
-            if rd.read_exact(&mut len_buf).await.is_err() { break; }
+            if rd.read_exact(&mut len_buf).await.is_err() {
+                info!("⚠️ [Worker] Master との接続が切断されました。");
+                break;
+            }
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut msg_buf = vec![0u8; len];
-            if rd.read_exact(&mut msg_buf).await.is_err() { break; }
+            if rd.read_exact(&mut msg_buf).await.is_err() {
+                break;
+            }
 
             if let Ok(msg) = serde_json::from_slice::<MasterToWorkerMsg>(&msg_buf) {
                 match msg {
                     MasterToWorkerMsg::AssignTask(task) => {
-                        let tx_clone = tx.clone();
-                        let worker_id = self.worker_id.clone();
+                        info!("🎯 [Worker] タスクを受領しました: task_id={} command={}", task.task_id, task.command);
+
+                        let wr_task = wr.clone();
                         tokio::spawn(async move {
-                            let result = Self::execute_task(&worker_id, task).await;
-                            let _ = tx_clone.send(WorkerToMasterMsg::TaskFinished(result)).await;
+                            let output = Command::new(&task.command)
+                                .args(&task.args)
+                                .output()
+                                .await;
+
+                            let result = match output {
+                                Ok(out) => TaskResult {
+                                    task_id: task.task_id,
+                                    success: out.status.success(),
+                                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                                },
+                                Err(e) => TaskResult {
+                                    task_id: task.task_id,
+                                    success: false,
+                                    stdout: String::new(),
+                                    stderr: e.to_string(),
+                                },
+                            };
+
+                            let finish_msg = WorkerToMasterMsg::TaskFinished(result);
+                            let _ = Self::send_msg(&wr_task, &finish_msg).await;
                         });
                     }
                     MasterToWorkerMsg::Ping => {}
@@ -126,43 +102,15 @@ impl Worker {
         Ok(())
     }
 
-    async fn execute_task(worker_id: &str, task: TaskSpec) -> TaskResult {
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = Command::new("cmd");
-            let full_cmd = format!("chcp 65001 >nul && {} {}", task.command, task.args.join(" "));
-            c.args(&["/C", &full_cmd]);
-            c
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = {
-            let mut c = Command::new(&task.command);
-            c.args(&task.args);
-            c
-        };
-
-        match cmd.output().await {
-            Ok(output) => {
-                let success = output.status.success();
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                TaskResult {
-                    task_id: task.task_id,
-                    success,
-                    stdout,
-                    stderr,
-                }
-            }
-            Err(e) => {
-                error!("[Worker:{}] Failed to spawn process for task {}: {:?}", worker_id, task.task_id, e);
-                TaskResult {
-                    task_id: task.task_id,
-                    success: false,
-                    stdout: String::new(),
-                    stderr: format!("Failed to execute command: {}", e),
-                }
-            }
-        }
+    async fn send_msg(
+        wr: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        msg: &WorkerToMasterMsg,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = serde_json::to_vec(msg)?;
+        let len = (bytes.len() as u32).to_be_bytes();
+        let mut guard = wr.lock().await;
+        guard.write_all(&len).await?;
+        guard.write_all(&bytes).await?;
+        Ok(())
     }
 }

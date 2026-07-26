@@ -1,61 +1,45 @@
 use ninja::core::worker::WorkerNode;
-use std::env;
-use tracing::info;
+use rand::Rng;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ログ出力の初期化 (RUST_LOG=info cargo run --bin worker)
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = env::args().collect();
+    let mut rng = rand::thread_rng();
+    let worker_id = format!("worker-{}", rng.gen_range(1000..9999));
+    let target_addr = "127.0.0.1:9001";
 
-    // コマンドライン引数 または デフォルト値
-    let worker_id = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| format!("worker-{}", std::process::id()));
-
-    let server_addr = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:9001".to_string());
-
-    println!("Starting Ninja Worker [{}] -> target: {}", worker_id, server_addr);
+    println!("Starting Ninja Worker [{}] -> target: {}", worker_id, target_addr);
     println!("💡 終了するには 'q' を入力して Enter を押すか、Ctrl + C を押してください。");
 
-    let worker = WorkerNode::new(worker_id, server_addr);
+    let worker = WorkerNode::new(worker_id, target_addr);
 
-    // 'q' キー入力監視用のチャネル
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // 標準入力を非同期で読み取るための準備
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
 
-    // 標準入力監視タスク (Enter付きの 'q' 入力を安定して受け取る)
-    std::thread::spawn(move || {
-        let mut input = String::new();
-        while std::io::stdin().read_line(&mut input).is_ok() {
-            if input.trim().eq_ignore_ascii_case("q") {
-                let _ = shutdown_tx.blocking_send(());
-                break;
-            }
-            input.clear();
-        }
-    });
-
+    // 1. Worker のメインループ
+    // 2. キーボード入力 ('q' で終了)
+    // 3. Ctrl + C シグナル
+    // のいずれかが発生するのを待機
     tokio::select! {
-        // Worker 本体の非同期実行ループ
         res = worker.run() => {
             if let Err(e) = res {
-                eprintln!("Worker error: {:?}", e);
+                eprintln!("Worker エラー: {}", e);
             }
         }
-
-        // 'q' + Enter による終了検知
-        _ = shutdown_rx.recv() => {
-            info!("🛑 'q' キー入力を検知しました。Workerを終了します...");
+        _ = async {
+            while let Ok(Some(line)) = reader.next_line().await {
+                if line.trim().eq_ignore_ascii_case("q") {
+                    break;
+                }
+            }
+        } => {
+            println!("\n👋 'q' キーが入力されたため、Worker を終了します...");
         }
-
-        // Ctrl + C シグナルの監視
         _ = tokio::signal::ctrl_c() => {
-            info!("🛑 Ctrl+C を検知しました。Workerを終了します...");
+            println!("\n👋 Ctrl+C を検知したため、Worker を終了します...");
         }
     }
 
