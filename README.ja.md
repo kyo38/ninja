@@ -1,4 +1,4 @@
-# Scion → Ninja
+#  Ninja
 
 分散DAG実行基盤 実験プロジェクト
 
