@@ -1,4 +1,4 @@
-# Scion → Ninja
+# Ninja
 
 Distributed DAG Execution Engine (Experimental)
 
