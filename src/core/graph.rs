@@ -1,120 +1,187 @@
-// src/core/graph.rs
-
-use serde::{Deserialize, Serialize};
+use crate::protocol::TaskSpec;
 use std::collections::HashMap;
+use thiserror::Error;
 
-/// タスクの実行結果
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum TaskResult {
-    /// 正常終了（Exit Code 0）
-    Success { stdout: String },
-    /// コマンド自体の実行失敗（Exit Code 1など - アプリケーション論理エラー）
-    Failure { exit_code: i32, stderr: String },
-    /// インフラ障害（Worker応答なし、タイムアウト、通信途絶）
-    InfraError { reason: String },
+pub use crate::protocol::{TaskResultSpec as TaskResult, TaskSpec as Task};
+
+#[derive(Debug, Error)]
+pub enum DagError {
+    #[error("タスクが見つかりません: {0}")]
+    TaskNotFound(String),
+
+    #[error("循環依存が検出されました (DAG違反)")]
+    CyclicDependency,
+
+    #[error("無効なタスク状態遷移です: {0}")]
+    InvalidStatusTransition(String),
 }
 
-/// タスクの詳細なライフサイクル状態
-#[derive(Debug, Clone, PartialEq)]
-pub enum TaskState {
-    /// 待機中
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
     Pending,
-    /// 実行中（割り当てられた Worker ID）
-    Running { worker_id: usize },
-    /// リトライ待機中（現在の試行回数）
-    Retrying { attempt: u32 },
-    /// 成功完了
-    Success,
-    /// 最終失敗（リトライ上限超過等）
+    Running,
+    Completed,
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Task {
-    pub name: String,
-    pub command: String,
-    pub dependencies: Vec<String>,
-    pub timeout_secs: u64,
-    pub max_retries: u32,
+#[derive(Debug, Clone)]
+pub struct TaskNode {
+    pub spec: TaskSpec,
+    pub status: TaskStatus,
+    pub children: Vec<String>,
+    pub in_degree: usize,
 }
 
-pub struct DagScheduler {
-    tasks: Vec<Task>,
-    adj_list: HashMap<String, Vec<String>>,
-    in_degree: HashMap<String, usize>,
+#[derive(Debug, Clone, Default)]
+pub struct Dag {
+    nodes: HashMap<String, TaskNode>,
 }
 
-impl DagScheduler {
-    pub fn new(tasks: Vec<Task>) -> Result<Self, String> {
-        let mut adj_list: HashMap<String, Vec<String>> = HashMap::new();
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
+impl Dag {
+    pub fn new() -> Self {
+        Self {
+            nodes: HashMap::new(),
+        }
+    }
 
-        for task in &tasks {
-            adj_list.entry(task.name.clone()).or_default();
-            in_degree.entry(task.name.clone()).or_insert(0);
+    /// タスクを追加し、spec 内に記載された dependencies を元に入次数を構築
+    pub fn add_task(&mut self, spec: TaskSpec) {
+        let id = spec.task_id.clone();
+        let deps = spec.dependencies.clone();
+
+        self.nodes.entry(id.clone()).or_insert(TaskNode {
+            spec,
+            status: TaskStatus::Pending,
+            children: Vec::new(),
+            in_degree: 0,
+        });
+
+        // 既知の依存関係があればエッジを張る
+        for dep_id in deps {
+            let _ = self.add_dependency(&dep_id, &id);
+        }
+    }
+
+    pub fn add_dependency(&mut self, parent_id: &str, child_id: &str) -> Result<(), DagError> {
+        if !self.nodes.contains_key(parent_id) || !self.nodes.contains_key(child_id) {
+            // ノードが揃っていない段階での呼び出しはスキップを許可、またはエラー処理
+            return Ok(());
         }
 
-        for task in &tasks {
-            for dep in &task.dependencies {
-                if !in_degree.contains_key(dep) {
-                    return Err(format!("存在しない依存タスクです: {}", dep));
-                }
-                adj_list.entry(dep.clone()).or_default().push(task.name.clone());
-                *in_degree.entry(task.name.clone()).or_insert(0) += 1;
+        if let Some(parent_node) = self.nodes.get_mut(parent_id) {
+            if !parent_node.children.contains(&child_id.to_string()) {
+                parent_node.children.push(child_id.to_string());
             }
         }
 
-        let sched = Self { tasks, adj_list, in_degree };
-        if sched.has_cycle() {
-            return Err("DAGに循環依存（サイクル）が検出されました".to_string());
+        if let Some(child_node) = self.nodes.get_mut(child_id) {
+            child_node.in_degree += 1;
         }
 
-        Ok(sched)
+        Ok(())
     }
 
-    fn has_cycle(&self) -> bool {
-        let mut in_degree_copy = self.in_degree.clone();
-        let mut queue: Vec<String> = in_degree_copy
+    pub fn get_ready_tasks(&self) -> Vec<TaskSpec> {
+        self.nodes
+            .values()
+            .filter(|node| node.status == TaskStatus::Pending && node.in_degree == 0)
+            .map(|node| node.spec.clone())
+            .collect()
+    }
+
+    pub fn mark_running(&mut self, task_id: &str) -> Result<(), DagError> {
+        let node = self
+            .nodes
+            .get_mut(task_id)
+            .ok_or_else(|| DagError::TaskNotFound(task_id.to_string()))?;
+
+        if node.status != TaskStatus::Pending {
+            return Err(DagError::InvalidStatusTransition(format!(
+                "Task {} is not Pending",
+                task_id
+            )));
+        }
+
+        node.status = TaskStatus::Running;
+        Ok(())
+    }
+
+    pub fn mark_completed(&mut self, task_id: &str) -> Result<Vec<TaskSpec>, DagError> {
+        let children = {
+            let node = self
+                .nodes
+                .get_mut(task_id)
+                .ok_or_else(|| DagError::TaskNotFound(task_id.to_string()))?;
+
+            node.status = TaskStatus::Completed;
+            node.children.clone()
+        };
+
+        let mut newly_ready = Vec::new();
+
+        for child_id in children {
+            if let Some(child_node) = self.nodes.get_mut(&child_id) {
+                if child_node.in_degree > 0 {
+                    child_node.in_degree -= 1;
+                }
+                if child_node.in_degree == 0 && child_node.status == TaskStatus::Pending {
+                    newly_ready.push(child_node.spec.clone());
+                }
+            }
+        }
+
+        Ok(newly_ready)
+    }
+
+    pub fn mark_failed(&mut self, task_id: &str) -> Result<(), DagError> {
+        let node = self
+            .nodes
+            .get_mut(task_id)
+            .ok_or_else(|| DagError::TaskNotFound(task_id.to_string()))?;
+
+        node.status = TaskStatus::Failed;
+        Ok(())
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.nodes
+            .values()
+            .all(|node| node.status == TaskStatus::Completed || node.status == TaskStatus::Failed)
+    }
+
+    pub fn validate_dag(&self) -> Result<(), DagError> {
+        let mut in_degrees: HashMap<String, usize> = self
+            .nodes
+            .iter()
+            .map(|(id, node)| (id.clone(), node.in_degree))
+            .collect();
+
+        let mut zero_in_degree: Vec<String> = in_degrees
             .iter()
             .filter(|(_, &deg)| deg == 0)
-            .map(|(name, _)| name.clone())
+            .map(|(id, _)| id.clone())
             .collect();
 
         let mut visited_count = 0;
 
-        while let Some(node) = queue.pop() {
+        while let Some(id) = zero_in_degree.pop() {
             visited_count += 1;
-            if let Some(neighbors) = self.adj_list.get(&node) {
-                for neighbor in neighbors {
-                    if let Some(deg) = in_degree_copy.get_mut(neighbor) {
+            if let Some(node) = self.nodes.get(&id) {
+                for child_id in &node.children {
+                    if let Some(deg) = in_degrees.get_mut(child_id) {
                         *deg -= 1;
                         if *deg == 0 {
-                            queue.push(neighbor.clone());
+                            zero_in_degree.push(child_id.clone());
                         }
                     }
                 }
             }
         }
 
-        visited_count != self.tasks.len()
-    }
-
-    /// 現在実行可能なタスクのリストを返す
-    pub fn get_ready_tasks(&self, states: &HashMap<String, TaskState>) -> Vec<String> {
-        let mut ready = Vec::new();
-
-        for task in &self.tasks {
-            if let Some(TaskState::Pending) = states.get(&task.name) {
-                let deps_satisfied = task.dependencies.iter().all(|dep| {
-                    matches!(states.get(dep), Some(TaskState::Success))
-                });
-
-                if deps_satisfied {
-                    ready.push(task.name.clone());
-                }
-            }
+        if visited_count == self.nodes.len() {
+            Ok(())
+        } else {
+            Err(DagError::CyclicDependency)
         }
-
-        ready
     }
 }

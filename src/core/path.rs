@@ -1,7 +1,5 @@
 #![allow(dead_code)]
-
-use crate::core::worker::WorkerSession;
-
+use crate::server::worker_pool::WorkerSession;
 /// ネットワーク転送用のルーティングヘッダー
 #[derive(Debug, Clone)]
 pub struct PathHeader {

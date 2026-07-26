@@ -1,14 +1,18 @@
-// src/server/worker_pool.rs
-
+use crate::core::error::NinjaError;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Notify};
 use tracing::info;
-use crate::core::error::NinjaError;
 
+/// Workerとの通信セッションおよび状態メトリクス
+#[derive(Debug)]
 pub struct WorkerSession {
-    pub id: usize,
+    pub id: String,
+    pub address: String,
+    pub is_alive: bool,
+    pub active_tasks: usize,
+    pub latency_ms: u64,
     pub stream: TcpStream,
 }
 
@@ -38,10 +42,23 @@ impl WorkerPool {
             loop {
                 if let Ok((stream, client_addr)) = listener.accept().await {
                     id_counter += 1;
-                    info!("🤝 [Master] Workerがクラスタに参加しました: {} (ID: {})", client_addr, id_counter);
+                    let worker_id = format!("worker-{}", id_counter);
+                    let address_str = client_addr.to_string();
+
+                    info!(
+                        "🤝 [Master] Workerがクラスタに参加しました: {} (ID: {})",
+                        address_str, worker_id
+                    );
 
                     let mut list = workers_clone.lock().await;
-                    list.push(WorkerSession { id: id_counter, stream });
+                    list.push(WorkerSession {
+                        id: worker_id,
+                        address: address_str,
+                        is_alive: true,
+                        active_tasks: 0,
+                        latency_ms: 0,
+                        stream,
+                    });
 
                     pulse_clone.notify_waiters();
                 }
@@ -55,7 +72,9 @@ impl WorkerPool {
     pub async fn send_command(&self, command: &str) -> Result<String, NinjaError> {
         let mut list = self.workers.lock().await;
         if list.is_empty() {
-            return Err(NinjaError::WorkerError("利用可能な Worker 接続がありません。".into()));
+            return Err(NinjaError::WorkerError(
+                "利用可能な Worker 接続がありません。".into(),
+            ));
         }
 
         // 先頭の WorkerSession を利用して通信

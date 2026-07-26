@@ -1,155 +1,297 @@
-// src/server/orchestrator.rs
-
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use std::collections::{HashMap, VecDeque, HashSet};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+use std::sync::Arc;
+use serde::{Serialize, Deserialize};
+use tracing::{info, warn};
 
 use crate::core::config::Config;
-use crate::error::Result;
 
-static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(1);
-
-pub struct Orchestrator {
-    config: Config,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskSpec {
+    pub task_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub dependencies: Vec<String>,
 }
 
-impl Orchestrator {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TaskResult {
+    pub task_id: String,
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MasterToWorkerMsg {
+    AssignTask(TaskSpec),
+    Ping,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum WorkerToMasterMsg {
+    Register { worker_id: String },
+    Heartbeat { worker_id: String },
+    TaskFinished(TaskResult),
+}
+
+/// DAG スケジューラ
+pub struct DagScheduler {
+    tasks: HashMap<String, TaskSpec>,
+    in_degree: HashMap<String, usize>,
+    dependents: HashMap<String, Vec<String>>,
+    ready_queue: VecDeque<String>,
+    completed_tasks: HashSet<String>,
+    failed_tasks: HashSet<String>,
+}
+
+impl DagScheduler {
+    pub fn new(tasks_vec: Vec<TaskSpec>) -> Self {
+        let mut tasks = HashMap::new();
+        let mut in_degree = HashMap::new();
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut ready_queue = VecDeque::new();
+
+        for task in &tasks_vec {
+            tasks.insert(task.task_id.clone(), task.clone());
+            in_degree.insert(task.task_id.clone(), task.dependencies.len());
+
+            if task.dependencies.is_empty() {
+                ready_queue.push_back(task.task_id.clone());
+            }
+
+            for dep in &task.dependencies {
+                dependents.entry(dep.clone()).or_default().push(task.task_id.clone());
+            }
+        }
+
+        Self {
+            tasks,
+            in_degree,
+            dependents,
+            ready_queue,
+            completed_tasks: HashSet::new(),
+            failed_tasks: HashSet::new(),
+        }
     }
 
-    pub fn from_config(config: Config) -> Self {
-        Self::new(config)
+    pub fn pop_ready_task(&mut self) -> Option<TaskSpec> {
+        if let Some(task_id) = self.ready_queue.pop_front() {
+            self.tasks.get(&task_id).cloned()
+        } else {
+            None
+        }
     }
 
-    pub async fn run(&self) -> Result<()> {
-        info!("💡 終了するには 'q' を入力して Enter を押すか、Ctrl + C を押してください。");
-
-        let worker_listener = TcpListener::bind(&self.config.worker_addr).await?;
-        info!("📡 [Master] Workerからの接続を待機中... (ポート: {})", self.config.worker_addr);
-
-        let client_listener = TcpListener::bind(&self.config.client_addr).await?;
-        info!("📡 [Master] クライアントからのDAGタスク投入を待機中... (ポート: {})", self.config.client_addr);
-
-        let mut stdin = tokio::io::stdin();
-        let mut key_buf = [0u8; 1];
-
-        loop {
-            tokio::select! {
-                // 'q' キーでの終了判定
-                res = stdin.read(&mut key_buf) => {
-                    if let Ok(n) = res {
-                        if n > 0 && (key_buf[0] == b'q' || key_buf[0] == b'Q') {
-                            info!("🛑 'q' キーを検知しました。Masterを終了します...");
-                            break;
+    /// タスク完了通知を受け取り、成功した場合のみ後続タスクの依存状態を更新する
+    pub fn mark_task_result(&mut self, task_id: &str, success: bool) {
+        if success {
+            self.completed_tasks.insert(task_id.to_string());
+            if let Some(deps) = self.dependents.get(task_id) {
+                for next_id in deps {
+                    if let Some(count) = self.in_degree.get_mut(next_id) {
+                        if *count > 0 {
+                            *count -= 1;
+                            if *count == 0 {
+                                info!("🔓 依存関係が解決しました: タスク [{}] が実行可能になりました", next_id);
+                                self.ready_queue.push_back(next_id.clone());
+                            }
                         }
-                    }
-                }
-
-                // Worker からの接続受入
-                accept_res = worker_listener.accept() => {
-                    match accept_res {
-                        Ok((stream, peer_addr)) => {
-                            tokio::spawn(Self::handle_worker(stream, peer_addr));
-                        }
-                        Err(e) => {
-                            error!(error = %e, "❌ Worker接続アクセプトエラー");
-                        }
-                    }
-                }
-
-                // クライアントからの接続受入（ダミー受領）
-                client_res = client_listener.accept() => {
-                    if let Ok((_stream, peer_addr)) = client_res {
-                        info!(addr = %peer_addr, "📩 クライアントからのDAGタスク要求を受け取りました");
                     }
                 }
             }
+        } else {
+            self.failed_tasks.insert(task_id.to_string());
+            warn!("⚠️ タスク [{}] が失敗したため、これに依存する後続タスクの実行はスキップされます", task_id);
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        (self.completed_tasks.len() + self.failed_tasks.len()) == self.tasks.len()
+    }
+}
+
+pub struct Orchestrator {
+    worker_addr: String,
+    client_addr: String,
+    scheduler: Arc<Mutex<Option<DagScheduler>>>,
+    workers: Arc<Mutex<HashMap<usize, tokio::sync::mpsc::Sender<MasterToWorkerMsg>>>>,
+}
+
+impl Orchestrator {
+    pub fn new(worker_addr: impl Into<String>, client_addr: impl Into<String>) -> Self {
+        Self {
+            worker_addr: worker_addr.into(),
+            client_addr: client_addr.into(),
+            scheduler: Arc::new(Mutex::new(None)),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 設定オブジェクトからアドレスを取得するように修正
+    pub fn from_config(config: Config) -> Self {
+        Self::new(config.worker_addr, config.client_addr)
+    }
+
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("=== 🥷 Ninja Distributed Master (Orchestrator) ===");
+        info!("📡 サービスポートの設定を読み込みました worker_addr={} client_addr={}", self.worker_addr, self.client_addr);
+        info!("💡 終了するには 'q' を入力して Enter を押すか、Ctrl + C を押してください。");
+
+        let worker_listener = TcpListener::bind(&self.worker_addr).await?;
+        let client_listener = TcpListener::bind(&self.client_addr).await?;
+
+        info!("📡 [Master] Workerからの接続を待機中... (ポート: {})", self.worker_addr);
+        info!("📡 [Master] クライアントからのDAGタスク投入を待機中... (ポート: {})", self.client_addr);
+
+        let workers = self.workers.clone();
+        let scheduler = self.scheduler.clone();
+
+        // Worker受付ループ
+        let workers_clone = workers.clone();
+        let scheduler_clone = scheduler.clone();
+        tokio::spawn(async move {
+            let mut internal_id_counter = 0;
+            loop {
+                if let Ok((socket, addr)) = worker_listener.accept().await {
+                    internal_id_counter += 1;
+                    let internal_id = internal_id_counter;
+                    info!("🤝 [Master] Workerがクラスタに参加しました internal_id={} addr={}", internal_id, addr);
+
+                    let workers_inner = workers_clone.clone();
+                    let scheduler_inner = scheduler_clone.clone();
+
+                    tokio::spawn(async move {
+                        Self::handle_worker(socket, internal_id, workers_inner, scheduler_inner).await;
+                    });
+                }
+            }
+        });
+
+        // Client受付ループ
+        let scheduler_clone = scheduler.clone();
+        let workers_clone = workers.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut socket, addr)) = client_listener.accept().await {
+                    info!("📩 クライアントからのDAGタスク要求を受け取りました addr={}", addr);
+                    let mut buf = vec![0u8; 65536];
+                    if let Ok(n) = socket.read(&mut buf).await {
+                        if n > 0 {
+                            if let Ok(tasks) = serde_json::from_slice::<Vec<TaskSpec>>(&buf[..n]) {
+                                info!("🚀 クライアントから {} 件のタスクを受領し、DAGスケジューラを初期化しました task_count={}", tasks.len(), tasks.len());
+                                {
+                                    let mut sched_guard = scheduler_clone.lock().await;
+                                    *sched_guard = Some(DagScheduler::new(tasks));
+                                }
+                                let _ = socket.write_all(b"Tasks received").await;
+                                Self::dispatch_tasks(scheduler_clone.clone(), workers_clone.clone()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // stdio 監視（'q' で終了）
+        let mut input = String::new();
+        while std::io::stdin().read_line(&mut input).is_ok() {
+            if input.trim() == "q" {
+                info!("👋 シャットダウン要求を受信しました。終了します。");
+                break;
+            }
+            input.clear();
         }
 
         Ok(())
     }
 
-    /// Worker 1台との通信・生存確認（ハートビート）を担当するループ
-    async fn handle_worker(stream: TcpStream, peer_addr: std::net::SocketAddr) {
-        let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::SeqCst);
-        info!(
-            worker_id = worker_id,
-            addr = %peer_addr,
-            "🤝 [Master] Workerがクラスタに参加しました"
-        );
+    async fn handle_worker(
+        socket: TcpStream,
+        internal_id: usize,
+        workers: Arc<Mutex<HashMap<usize, tokio::sync::mpsc::Sender<MasterToWorkerMsg>>>>,
+        scheduler: Arc<Mutex<Option<DagScheduler>>>,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MasterToWorkerMsg>(32);
 
-        let (reader, mut writer) = stream.into_split();
-        let mut buf_reader = BufReader::new(reader);
+        let (mut rd, mut wr) = socket.into_split();
 
-        // 15秒間何も通信がなければノード離脱（死んだ）と判断
-        let heartbeat_timeout = Duration::from_secs(15);
+        // 送信タスク
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Ok(bytes) = serde_json::to_vec(&msg) {
+                    let len = (bytes.len() as u32).to_be_bytes();
+                    if wr.write_all(&len).await.is_err() { break; }
+                    if wr.write_all(&bytes).await.is_err() { break; }
+                }
+            }
+        });
 
+        let mut len_buf = [0u8; 4];
         loop {
-            let mut line = String::new();
+            if rd.read_exact(&mut len_buf).await.is_err() { break; }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut msg_buf = vec![0u8; len];
+            if rd.read_exact(&mut msg_buf).await.is_err() { break; }
 
-            match timeout(heartbeat_timeout, buf_reader.read_line(&mut line)).await {
-                Ok(Ok(0)) => {
-                    info!(
-                        worker_id = worker_id,
-                        "👋 Workerとの接続が切断されました（正常切断）"
-                    );
-                    break;
-                }
-                Ok(Ok(_)) => {
-                    let msg = line.trim().to_string();
-                    if msg.is_empty() {
-                        continue;
+            if let Ok(msg) = serde_json::from_slice::<WorkerToMasterMsg>(&msg_buf) {
+                match msg {
+                    WorkerToMasterMsg::Register { worker_id } => {
+                        info!("📝 Workerが登録されました internal_id={} worker_id={}", internal_id, worker_id);
+                        workers.lock().await.insert(internal_id, tx.clone());
                     }
-
-                    if msg == "PING" {
-                        debug!(worker_id = worker_id, "💓 [Heartbeat] PINGを受信 -> PONGを返信します");
-                        if let Err(e) = writer.write_all(b"PONG\n").await {
-                            error!(
-                                worker_id = worker_id,
-                                error = %e,
-                                "❌ PONG送信エラー。接続を破棄します"
-                            );
-                            break;
-                        }
-                        if let Err(e) = writer.flush().await {
-                            error!(
-                                worker_id = worker_id,
-                                error = %e,
-                                "❌ PONG Flushエラー。接続を破棄します"
-                            );
-                            break;
-                        }
-                    } else {
+                    WorkerToMasterMsg::Heartbeat { worker_id } => {
+                        info!("💓 [Heartbeat] 受信 internal_id={} worker_id={}", internal_id, worker_id);
+                    }
+                    WorkerToMasterMsg::TaskFinished(result) => {
                         info!(
-                            worker_id = worker_id,
-                            response = %msg,
-                            "📥 Workerからタスク実行結果を受信しました"
+                            "📥 Workerからタスク実行結果を受信しました internal_id={} task_id={} success={} stdout={} stderr={}",
+                            internal_id, result.task_id, result.success, result.stdout.trim(), result.stderr.trim()
                         );
+
+                        let mut finished = false;
+                        {
+                            let mut sched_guard = scheduler.lock().await;
+                            if let Some(ref mut sched) = *sched_guard {
+                                sched.mark_task_result(&result.task_id, result.success);
+                                if sched.is_finished() {
+                                    finished = true;
+                                }
+                            }
+                        }
+
+                        if finished {
+                            info!("🎉 [Scheduler] すべての DAG タスクの処理が完了しました！");
+                        } else {
+                            Self::dispatch_tasks(scheduler.clone(), workers.clone()).await;
+                        }
                     }
-                }
-                Ok(Err(e)) => {
-                    error!(
-                        worker_id = worker_id,
-                        error = %e,
-                        "❌ Workerとの通信中にエラーが発生しました"
-                    );
-                    break;
-                }
-                Err(_) => {
-                    warn!(
-                        worker_id = worker_id,
-                        timeout_secs = heartbeat_timeout.as_secs(),
-                        "⏰ [Heartbeat] タイムアウト！Workerからの応答が絶たれたため接続を解放します"
-                    );
-                    break;
                 }
             }
         }
 
-        info!(worker_id = worker_id, "🧹 Workerの管理リソースをクリーンアップしました");
+        workers.lock().await.remove(&internal_id);
+    }
+
+    async fn dispatch_tasks(
+        scheduler: Arc<Mutex<Option<DagScheduler>>>,
+        workers: Arc<Mutex<HashMap<usize, tokio::sync::mpsc::Sender<MasterToWorkerMsg>>>>,
+    ) {
+        let mut sched_guard = scheduler.lock().await;
+        if let Some(ref mut sched) = *sched_guard {
+            let workers_guard = workers.lock().await;
+            if workers_guard.is_empty() { return; }
+
+            for (&internal_id, tx) in workers_guard.iter() {
+                if let Some(task) = sched.pop_ready_task() {
+                    info!("🚀 [Scheduler] タスクを Worker に割り当てます internal_id={} task_id={} command={}", internal_id, task.task_id, task.command);
+                    let _ = tx.send(MasterToWorkerMsg::AssignTask(task)).await;
+                } else {
+                    break;
+                }
+            }
+        }
     }
 }

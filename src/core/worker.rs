@@ -1,87 +1,168 @@
-#![allow(dead_code)]
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command;
+use serde::{Serialize, Deserialize};
+use tracing::error;
 
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use std::time::Duration;
-
-/// ワーカーの生存状態と負荷状況を管理するセッション構造体
-#[derive(Debug, Clone)]
-pub struct WorkerSession {
-    pub address: String,
-    pub active_tasks: usize,
-    pub latency_ms: u64,
-    pub is_alive: bool,
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskSpec {
+    pub task_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub dependencies: Vec<String>,
 }
 
-/// 🥇 🔴 WorkerRegistry: ワーカーの状態・負荷管理をカプセル化するコンポーネント
-#[derive(Clone)]
-pub struct WorkerRegistry {
-    sessions: Arc<Mutex<Vec<WorkerSession>>>,
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TaskResult {
+    pub task_id: String,
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
 }
 
-impl WorkerRegistry {
-    /// アドレスのリストからレジストリを初期化する
-    pub fn new(worker_addresses: Vec<String>) -> Self {
-        let sessions = worker_addresses
-            .into_iter()
-            .map(|addr| WorkerSession {
-                address: addr,
-                active_tasks: 0,
-                latency_ms: 9999, // 初期値は大きな値（ペナルティ値）にしておく
-                is_alive: true,
-            })
-            .collect();
+#[derive(Serialize, Deserialize, Debug)]
+pub enum MasterToWorkerMsg {
+    AssignTask(TaskSpec),
+    Ping,
+}
 
+#[derive(Serialize, Deserialize, Debug)]
+pub enum WorkerToMasterMsg {
+    Register { worker_id: String },
+    Heartbeat { worker_id: String },
+    TaskFinished(TaskResult),
+}
+
+pub struct Worker {
+    worker_id: String,
+    target_addr: String,
+}
+
+/// 外部コードの `WorkerNode` 参照用エイリアス
+pub type WorkerNode = Worker;
+
+impl Worker {
+    /// &str と String のどちらの型でも直接渡せるように impl Into<String> を採用
+    pub fn new(worker_id: impl Into<String>, target_addr: impl Into<String>) -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(sessions)),
+            worker_id: worker_id.into(),
+            target_addr: target_addr.into(),
         }
     }
 
-    /// 戦略（Strategy）アルゴリズムが評価できるように、現在の全セッションのスナップショットを取得する
-    pub async fn get_cloned_sessions(&self) -> Vec<WorkerSession> {
-        let workers = self.sessions.lock().await;
-        workers.clone()
-    }
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("Starting Ninja Worker [{}] -> target: {}", self.worker_id, self.target_addr);
+        println!("💡 終了するには 'q' を入力して Enter を押すか、Ctrl + C を押してください。");
 
-    /// タスク実行開始前に、指定されたワーカーを専有（カウンタをインクリメント）する
-    pub async fn acquire(&self, address: &str) -> Result<(), String> {
-        let mut workers = self.sessions.lock().await;
-        if let Some(w) = workers.iter_mut().find(|w| w.address == address) {
-            if !w.is_alive {
-                return Err(format!("❌ ワーカー '{}' はダウンしています。", address));
-            }
-            w.active_tasks += 1;
-            println!("🔒 [WorkerRegistry] ワーカー専有: {} (現在の担当タスク数: {})", w.address, w.active_tasks);
-            Ok(())
-        } else {
-            Err(format!("❌ 指定されたワーカー '{}' が見つかりません。", address))
-        }
-    }
+        let socket = TcpStream::connect(&self.target_addr).await?;
+        let (mut rd, mut wr) = socket.into_split();
 
-    /// タスク完了時または失敗時に、指定されたワーカーを解放（カウンタをデクリメント）する
-    pub async fn release(&self, address: &str) {
-        let mut workers = self.sessions.lock().await;
-        if let Some(w) = workers.iter_mut().find(|w| w.address == address) {
-            if w.active_tasks > 0 {
-                w.active_tasks -= 1;
-            }
-            println!("🔓 [WorkerRegistry] ワーカー解放: {} (現在の担当タスク数: {})", w.address, w.active_tasks);
-        }
-    }
+        // 登録メッセージの送信
+        let reg_msg = WorkerToMasterMsg::Register { worker_id: self.worker_id.clone() };
+        let bytes = serde_json::to_vec(&reg_msg)?;
+        let len = (bytes.len() as u32).to_be_bytes();
+        wr.write_all(&len).await?;
+        wr.write_all(&bytes).await?;
 
-    /// 定期的なヘルスチェック用：バックグラウンドで全ワーカーのステータスを更新するループを起動
-    pub async fn start_heartbeat_loop(&self, interval: Duration) {
-        let sessions_clone = Arc::clone(&self.sessions);
+        // ハートビート送信タスク
+        let worker_id_clone = self.worker_id.clone();
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<WorkerToMasterMsg>(8);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
-                let mut workers = sessions_clone.lock().await;
-                for worker in workers.iter_mut() {
-                    // 本来はここで実際のPingやTCP疎通確認を行う
-                    worker.latency_ms = 10; 
-                    worker.is_alive = true;
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let hb = WorkerToMasterMsg::Heartbeat { worker_id: worker_id_clone.clone() };
+                if hb_tx.send(hb).await.is_err() { break; }
+            }
+        });
+
+        // メッセージ受信用チャンネル
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WorkerToMasterMsg>(32);
+
+        // 送信ループ処理
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(msg) = hb_rx.recv() => {
+                        if let Ok(bytes) = serde_json::to_vec(&msg) {
+                            let len = (bytes.len() as u32).to_be_bytes();
+                            if wr.write_all(&len).await.is_err() { break; }
+                            if wr.write_all(&bytes).await.is_err() { break; }
+                        }
+                    }
+                    Some(msg) = rx.recv() => {
+                        if let Ok(bytes) = serde_json::to_vec(&msg) {
+                            let len = (bytes.len() as u32).to_be_bytes();
+                            if wr.write_all(&len).await.is_err() { break; }
+                            if wr.write_all(&bytes).await.is_err() { break; }
+                        }
+                    }
                 }
             }
         });
+
+        // 受信ループ処理
+        let mut len_buf = [0u8; 4];
+        loop {
+            if rd.read_exact(&mut len_buf).await.is_err() { break; }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut msg_buf = vec![0u8; len];
+            if rd.read_exact(&mut msg_buf).await.is_err() { break; }
+
+            if let Ok(msg) = serde_json::from_slice::<MasterToWorkerMsg>(&msg_buf) {
+                match msg {
+                    MasterToWorkerMsg::AssignTask(task) => {
+                        let tx_clone = tx.clone();
+                        let worker_id = self.worker_id.clone();
+                        tokio::spawn(async move {
+                            let result = Self::execute_task(&worker_id, task).await;
+                            let _ = tx_clone.send(WorkerToMasterMsg::TaskFinished(result)).await;
+                        });
+                    }
+                    MasterToWorkerMsg::Ping => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn execute_task(worker_id: &str, task: TaskSpec) -> TaskResult {
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            let full_cmd = format!("chcp 65001 >nul && {} {}", task.command, task.args.join(" "));
+            c.args(&["/C", &full_cmd]);
+            c
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new(&task.command);
+            c.args(&task.args);
+            c
+        };
+
+        match cmd.output().await {
+            Ok(output) => {
+                let success = output.status.success();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                TaskResult {
+                    task_id: task.task_id,
+                    success,
+                    stdout,
+                    stderr,
+                }
+            }
+            Err(e) => {
+                error!("[Worker:{}] Failed to spawn process for task {}: {:?}", worker_id, task.task_id, e);
+                TaskResult {
+                    task_id: task.task_id,
+                    success: false,
+                    stdout: String::new(),
+                    stderr: format!("Failed to execute command: {}", e),
+                }
+            }
+        }
     }
 }

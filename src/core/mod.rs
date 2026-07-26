@@ -1,13 +1,11 @@
-// src/core/mod.rs
-
-pub mod graph;
+pub mod config;
+pub mod error;
 pub mod executor;
-pub mod retry;
-pub mod worker;
+pub mod graph;
 pub mod packet;
 pub mod path;
-pub mod error; 
-pub mod config; 
+pub mod retry;
+pub mod worker;
 
-pub use error::NinjaError;
 pub use config::Config;
+pub use error::NinjaError;

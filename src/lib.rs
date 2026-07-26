@@ -1,6 +1,8 @@
 pub mod core;
+pub mod dag;
 pub mod error;
 pub mod platform;
+pub mod protocol;
 pub mod server;
 pub mod transport;
 
