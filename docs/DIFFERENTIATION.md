@@ -60,7 +60,7 @@ Plugin-ready architecture supporting external task definitions (JSON / YAML / TO
 | **Infrastructure Deps** | External DB (PostgreSQL), Web Server | Ray Cluster / Head Node | Kubernetes Cluster | **None (Single Binary)** |
 | **Scheduling Granularity**| Minutes to Seconds | Milliseconds | Seconds to Minutes (Pod Overhead)| **Milliseconds** |
 | **System Overhead** | High (DB Sync & Python Processes) | Medium (Ray Agent Management) | Extremely High (Pod Startup/Teardown) | **Minimal (TCP / JSON Frame Protocol)** |
-| **Target Environment** | Linux-Centric | Linux-Centric | K8s Cluster Required | **Windows 11 / Linux (Edge Compatible)** |
+| **Target Environment** | Linux-Centric | Linux-Centric | K8s Cluster Required | **Windows 11** |
 
 ---
 
