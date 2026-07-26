@@ -70,7 +70,7 @@ Ninja is not intended to replace large-scale orchestration systems like Airflow 
 
 - **Simplicity is required**: Zero complex setup, no external database dependencies, and minimal operational overhead.
 - **Full control is needed**: Direct process execution, explicit DAG ordering, custom timeout control, and low-level protocol handling.
-- **Infrastructure is constrained**: Ideal for edge nodes, air-gapped networks, local development environments, and resource-restricted Windows 11 / Linux setups.
+- **Infrastructure is constrained**: Ideal for edge nodes, air-gapped networks, local development environments, and resource-restricted Windows 11 setups.
 
 It is particularly optimized for:
 - **Research & Experimental Environments**: Rapid prototyping of asynchronous distributed algorithms.
