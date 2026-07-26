@@ -60,7 +60,7 @@ Apache Airflow、Ray、Kubernetes Jobs などの既存の分散タスク管理�
 | **依存インフラ** | 外部DB (PostgreSQL等), Web | 専用クラスタ / Ray Head | Kubernetes クラスタ | **なし (単一バイナリで完結)** |
 | **スケジューリング精度** | 分単位〜数秒単位 | ミリ秒単位 | 数秒〜数分 (Pod起爆) | **ミリ秒単位** |
 | **オーバーヘッド** | 大 (DB同期・Python) | 中 (Ray Agent管理) | 極大 (コンテナ起動/破棄) | **極小 (TCP/JSONプロトコル)** |
-| **動作環境** | Linux中心 | Linux中心 | K8s環境必須 | **Windows 11 / Linux (エッジ対応)** |
+| **動作環境** | Linux中心 | Linux中心 | K8s環境必須 | **Windows 11** |
 
 ---
 
@@ -70,7 +70,7 @@ Ninja は Airflow や Kubernetes のような大規模オーケストレーシ�
 
 - **単純性・シンプルさが求められる場合 (Simplicity is required)**: 複雑な事前構築や外部データベース接続を一切必要とせず、運用コストを最小化。
 - **完全な制御が必要な場合 (Full control is needed)**: プロセス管理、厳格なDAG実行順序、タイムアウト制御、および低レイヤー通信を直接ハンドリング。
-- **インフラ環境に制約がある場合 (Infrastructure is constrained)**: エッジノード、閉域網・オフライン環境、ローカル開発環境、リソース制約のある Windows 11 / Linux 環境に最適。
+- **インフラ環境に制約がある場合 (Infrastructure is constrained)**: エッジノード、閉域網・オフライン環境、ローカル開発環境、リソース制約のある Windows 11 環境に最適。
 
 特に以下の用途に最適化されています：
 - **研究・実験環境**: 非同期分散アルゴリズムの高速なプロトタイピング
