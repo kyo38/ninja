@@ -155,3 +155,9 @@ cargo run --bin client
 - Deepen understanding of asynchronous distributed system architecture.
 - Build a robust DAG task execution model in Rust.
 - Master structured observability, async network protocol design, and real-time Web monitoring.
+
+## ■ Future Work & Architecture Roadmaps
+
+- **Master High Availability (HA)**: Implement Leader Election (e.g., Raft consensus) to eliminate the Single Point of Failure (SPOF) on the Master node.
+- **Dynamic Task Graph Updates**: Support dynamic DAG mutations and branching during runtime.
+- **Pluggable Storage Backends**: Optional SQLite/RocksDB backend for persistent task execution history and audit logs.
