@@ -66,8 +66,13 @@ Plugin-ready architecture supporting external task definitions (JSON / YAML / TO
 
 ## Positioning
 
-Ninja is not a replacement for large-scale enterprise orchestration platforms, but a complementary system optimized for:
+Ninja is not intended to replace large-scale orchestration systems like Airflow or Kubernetes, but to complement them in scenarios where:
 
-- **Research & Experimental Environments**: Rapid prototyping of asynchronous distributed system algorithms.
-- **Secure & Air-gapped Systems**: Standalone execution in factory networks or isolated Windows 11 / Linux edge nodes.
-- **Embedded Execution Engines**: Embedding high-speed, sub-millisecond DAG scheduling directly into systems engineering toolchains.
+- **Simplicity is required**: Zero complex setup, no external database dependencies, and minimal operational overhead.
+- **Full control is needed**: Direct process execution, explicit DAG ordering, custom timeout control, and low-level protocol handling.
+- **Infrastructure is constrained**: Ideal for edge nodes, air-gapped networks, local development environments, and resource-restricted Windows 11 / Linux setups.
+
+It is particularly optimized for:
+- **Research & Experimental Environments**: Rapid prototyping of asynchronous distributed algorithms.
+- **Secure & Air-gapped Systems**: Standalone execution without external cloud or container runtime dependencies.
+- **Embedded Execution Engines**: Integrating sub-millisecond DAG scheduling directly into engineering toolchains.
