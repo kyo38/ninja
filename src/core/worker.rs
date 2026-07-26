@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, info_span, Instrument};
 
 use crate::server::orchestrator::{MasterToWorkerMsg, WorkerToMasterMsg, TaskResult};
 
@@ -24,7 +24,6 @@ impl WorkerNode {
         let stream = TcpStream::connect(&self.server_addr).await?;
         info!("✅ [Worker] Master への接続に成功しました！");
 
-        // wr は Mutex に入れるため mut は不要です
         let (mut rd, wr) = stream.into_split();
         let wr = Arc::new(tokio::sync::Mutex::new(wr));
 
@@ -66,33 +65,54 @@ impl WorkerNode {
             if let Ok(msg) = serde_json::from_slice::<MasterToWorkerMsg>(&msg_buf) {
                 match msg {
                     MasterToWorkerMsg::AssignTask(task) => {
-                        info!("🎯 [Worker] タスクを受領しました: task_id={} command={}", task.task_id, task.command);
-
                         let wr_task = wr.clone();
-                        tokio::spawn(async move {
-                            let output = Command::new(&task.command)
-                                .args(&task.args)
-                                .output()
-                                .await;
+                        let worker_id = self.worker_id.clone();
 
-                            let result = match output {
-                                Ok(out) => TaskResult {
-                                    task_id: task.task_id,
-                                    success: out.status.success(),
-                                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-                                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-                                },
-                                Err(e) => TaskResult {
-                                    task_id: task.task_id,
-                                    success: false,
-                                    stdout: String::new(),
-                                    stderr: e.to_string(),
-                                },
-                            };
+                        // 💡 タスク実行単位の構造化 Span を定義
+                        let task_span = info_span!(
+                            "task_execution",
+                            worker_id = %worker_id,
+                            task_id = %task.task_id,
+                            command = %task.command
+                        );
 
-                            let finish_msg = WorkerToMasterMsg::TaskFinished(result);
-                            let _ = Self::send_msg(&wr_task, &finish_msg).await;
-                        });
+                        // .instrument(task_span) を使って非同期タスク全体に Span コンテキストを紐付け
+                        tokio::spawn(
+                            async move {
+                                info!("🎯 タスクの実行を開始します");
+
+                                let output = Command::new(&task.command)
+                                    .args(&task.args)
+                                    .output()
+                                    .await;
+
+                                let result = match output {
+                                    Ok(out) => {
+                                        info!(success = out.status.success(), "⚙️ コマンドの実行が完了しました");
+                                        TaskResult {
+                                            task_id: task.task_id,
+                                            success: out.status.success(),
+                                            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                                            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        info!(error = %e, "❌ コマンドの実行に失敗しました");
+                                        TaskResult {
+                                            task_id: task.task_id,
+                                            success: false,
+                                            stdout: String::new(),
+                                            stderr: e.to_string(),
+                                        }
+                                    }
+                                };
+
+                                let finish_msg = WorkerToMasterMsg::TaskFinished(result);
+                                let _ = Self::send_msg(&wr_task, &finish_msg).await;
+                                info!("📤 Master へタスク完了通知を送信しました");
+                            }
+                            .instrument(task_span),
+                        );
                     }
                     MasterToWorkerMsg::Ping => {}
                 }
