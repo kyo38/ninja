@@ -3,6 +3,7 @@
 Distributed DAG Execution Engine (Experimental)
 
 ![OS: Windows 11](https://img.shields.io/badge/OS-Windows%2011-blue?style=flat-square&logo=windows11)
+![OS: FreeBSD 15.1](https://img.shields.io/badge/OS-FreeBSD%2015.1-red?style=flat-square&logo=freebsd)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?style=flat-square&logo=rust)
 ![IDE: VS Code](https://img.shields.io/badge/IDE-VS%20Code-007ACC?style=flat-square&logo=visualstudiocode)
 
@@ -10,7 +11,7 @@ Distributed DAG Execution Engine (Experimental)
 
 ## ■ Overview
 
-This project is an experimental distributed execution engine based on **DAG (Directed Acyclic Graph)** task dependencies, developed specifically for Windows 11 environments using Rust and Tokio.
+This project is an experimental distributed execution engine based on **DAG (Directed Acyclic Graph)** task dependencies, developed and verified across **Windows 11** and **FreeBSD 15.1** environments using Rust and Tokio.
 
 It focuses on solving the "execution order guarantee problem" and ensuring network resilience in asynchronous environments through structured state synchronization, automatic reconnections, heartbeat death detection, dynamic failover, and real-time monitoring via an embedded Web Dashboard.
 
@@ -24,6 +25,7 @@ This system ensures strict execution order and high availability in an asynchron
 - **Bi-directional Heartbeat & Failover**: Proactive PINGs with 12-second timeout monitoring for silent disconnect detection and automatic task re-queuing.
 - **Structured Observability (`tracing::span`)**: Context-bound tracing across asynchronous task dispatches.
 - **Embedded Web Dashboard (Axum)**: Real-time HTML/JS UI and JSON REST API for live progress monitoring.
+- **Cross-Platform Support**: Fully verified and passing unit/integration test suite on both Windows 11 and FreeBSD 15.1.
 
 ---
 
@@ -45,14 +47,16 @@ This system ensures strict execution order and high availability in an asynchron
   * Abandoned task recovery & re-queuing to active workers ✔
 * **Phase 7: Completed (Axum Web Dashboard & HTTP API)**
   * HTTP REST API (`/api/status`, `/api/workers`, `/api/tasks`) ✔
-  * Embedded HTML/JS real-time dashboard UI (`[http://127.0.0.1:8080](http://127.0.0.1:8080)`) ✔
+  * Embedded HTML/JS real-time dashboard UI (`http://127.0.0.1:8080`) ✔
+* **Cross-Platform Support: Completed**
+  * FreeBSD 15.1 environment setup & test suite validation ✔
 
 ---
 
 ## ■ Prerequisites
 
-* **OS:** Windows 11 (Pro / Home)
-* **Toolchain:** Rust (stable-x86_64-pc-windows-msvc)
+* **OS:** Windows 11 (Pro / Home) / FreeBSD 15.1
+* **Toolchain:** Rust 1.97+ (`stable-x86_64-pc-windows-msvc` or FreeBSD native `pkg` toolchain)
 * **IDE:** VS Code (Recommended extension: `rust-analyzer`)
 
 ---
@@ -104,13 +108,13 @@ This system ensures strict execution order and high availability in an asynchron
 
 ---
 
-## ■ How to Run (Windows 11 / VS Code)
+## ■ How to Run
 
-Run the following commands in VS Code integrated terminal (PowerShell):
+Run the following commands in your terminal (PowerShell / `tcsh` / `bash`):
 
-```powershell
+```sh
 # 1. Clone repository
-git clone https://github.com/kyo38/ninja.git
+git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
 cd ninja
 
 # 2. Start Master node (Orchestrator)
@@ -123,10 +127,10 @@ cargo run --bin worker
 cargo run --bin client
 
 # 5. Access Web Dashboard in Browser:
-# http://127.0.0.1:8080
+# [http://127.0.0.1:8080](http://127.0.0.1:8080)
 ```
 
-> **Note:** To shut down Master and Worker nodes safely, type `q` and press `Enter` in their respective terminals. Debug logs can be enabled using `$env:RUST_LOG="info"`.
+> **Note:** To shut down Master and Worker nodes safely, type `q` and press `Enter` in their respective terminals. Debug logs can be enabled using `env RUST_LOG="info"` (POSIX) or `$env:RUST_LOG="info"` (PowerShell).
 
 ---
 
@@ -146,7 +150,7 @@ cargo run --bin client
 * **Web Framework:** Axum / Tower-HTTP
 * **Observability:** Tracing / Tracing-Subscriber
 * **Architecture:** Distributed Systems / DAG Scheduling
-* **Target OS:** Windows 11
+* **Target OS:** Windows 11, FreeBSD 15.1
 
 ---
 

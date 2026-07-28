@@ -1,8 +1,9 @@
-#  Ninja
+# Ninja
 
 分散DAG実行基盤 実験プロジェクト
 
 ![OS: Windows 11](https://img.shields.io/badge/OS-Windows%2011-blue?style=flat-square&logo=windows11)
+![OS: FreeBSD 15.1](https://img.shields.io/badge/OS-FreeBSD%2015.1-red?style=flat-square&logo=freebsd)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?style=flat-square&logo=rust)
 ![IDE: VS Code](https://img.shields.io/badge/IDE-VS%20Code-007ACC?style=flat-square&logo=visualstudiocode)
 
@@ -10,7 +11,7 @@
 
 ## ■ 概要
 
-本プロジェクトは、DAG（有向非巡回グラフ）に基づくタスク依存関係を分散環境で安全に実行するための制御基盤です。Windows 11 動作環境に最適化し、Rust および Tokio を用いて開発されています。
+本プロジェクトは、DAG（有向非巡回グラフ）に基づくタスク依存関係を分散環境で安全に実行するための制御基盤です。**Windows 11** および **FreeBSD 15.1** の両環境で動作検証が行われており、Rust および Tokio を用いて開発されています。
 
 非同期ネットワーク環境における「依存関係の順序保証」と「サイレント切断に対する耐障害性（リトライ・ハートビート・自動再割り当て）」に加え、構造化ログによる可観測性と組み込み Web ダッシュボードによるリアルタイムモニタリングを備えた堅牢なシステムです。
 
@@ -24,6 +25,7 @@
 - **双方向ハートビート & 自動フェイルオーバー**: PING/PONG 通信と 12秒タイムアウト監視で死体検知し、未完了タスクを自動再キューイング
 - **`tracing::span` 構造化ログ**: タスクIDや Worker 情報を紐付けた高度な可観測性
 - **組み込み Web ダッシュボード (Axum)**: リアルタイム HTML/JS UI と JSON REST API による進捗・状態監視
+- **クロスプラットフォーム対応**: Windows 11 および FreeBSD 15.1 の両環境で単体・結合テストスイートの全通過を確認
 
 ---
 
@@ -46,13 +48,15 @@
 * **Phase 7: 完了（Axum Web Dashboard & HTTP API）**
   * HTTP REST API (`/api/status`, `/api/workers`, `/api/tasks`) ✔
   * リアルタイム Web ダッシュボード UI (`http://127.0.0.1:8080`) ✔
+* **クロスプラットフォーム対応: 完了**
+  * FreeBSD 15.1 環境構築 & テストスイート検証 ✔
 
 ---
 
 ## ■ 動作要件・前提環境
 
-* **OS:** Windows 11 (Pro / Home)
-* **Toolchain:** Rust (stable-x86_64-pc-windows-msvc)
+* **OS:** Windows 11 (Pro / Home) / FreeBSD 15.1
+* **Toolchain:** Rust 1.97+（Windows: `stable-x86_64-pc-windows-msvc` / FreeBSD: `pkg` 純正ツールチェーン）
 * **IDE:** VS Code (推奨拡張機能: `rust-analyzer`)
 
 ---
@@ -104,11 +108,11 @@
 
 ---
 
-## ■ 実行手順 (Windows 11 / VS Code)
+## ■ 実行手順
 
-VS Code 上の統合ターミナル（PowerShell）で以下の手順を実行します。
+ご利用のターミナル（PowerShell / `tcsh` / `bash`）で以下のコマンドを実行します。
 
-```powershell
+```sh
 # 1. リポジトリを取得
 git clone [https://github.com/kyo38/ninja.git](https://github.com/kyo38/ninja.git)
 cd ninja
@@ -126,7 +130,7 @@ cargo run --bin client
 # [http://127.0.0.1:8080](http://127.0.0.1:8080)
 ```
 
-> **注記:** Master ノードおよび Worker ノードを安全にシャットダウンするには、それぞれのターミナル画面で `q` を入力して `Enter` を押してください。デバッグログは `$env:RUST_LOG="info"` で有効化できます。
+> **注記:** Master ノードおよび Worker ノードを安全にシャットダウンするには、それぞれのターミナル画面で `q` を入力して `Enter` を押してください。デバッグログの有効化は、POSIX環境（`tcsh`/`bash`）では `env RUST_LOG="info"`、PowerShell では `$env:RUST_LOG="info"` を利用します。
 
 ---
 
@@ -146,7 +150,7 @@ cargo run --bin client
 * **Web フレームワーク:** Axum / Tower-HTTP
 * **可観測性:** Tracing / Tracing-Subscriber
 * **アーキテクチャ:** 分散システム / DAG スケジューリング
-* **対象OS:** Windows 11
+* **対象OS:** Windows 11, FreeBSD 15.1
 
 ---
 
