@@ -166,3 +166,7 @@ cargo run --bin client
 - **Master High Availability (HA)**: Implement Leader Election (e.g., Raft consensus) to eliminate the Single Point of Failure (SPOF) on the Master node.
 - **Dynamic Task Graph Updates**: Support dynamic DAG mutations and branching during runtime.
 - **Pluggable Storage Backends**: Optional SQLite/RocksDB backend for persistent task execution history and audit logs.
+
+  ## Specification
+- English: docs/ninja_dag_spec_en.pdf
+- Japanese: docs/ninja_dag_spec_ja.pdf
