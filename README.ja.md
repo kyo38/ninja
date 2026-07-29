@@ -4,6 +4,7 @@
 
 ![OS: Windows 11](https://img.shields.io/badge/OS-Windows%2011-blue?style=flat-square&logo=windows11)
 ![OS: FreeBSD 15.1](https://img.shields.io/badge/OS-FreeBSD%2015.1-red?style=flat-square&logo=freebsd)
+![Linux (Fedora Atomic)](https://img.shields.io/badge/OS-Linux%20(Fedora%20Atomic)-green)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?style=flat-square&logo=rust)
 ![IDE: VS Code](https://img.shields.io/badge/IDE-VS%20Code-007ACC?style=flat-square&logo=visualstudiocode)
 
