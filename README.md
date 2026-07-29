@@ -1,7 +1,7 @@
 # Ninja
 
 Distributed DAG Execution Engine (Experimental)
-
+Specification: v0.1
 ![OS: Windows 11](https://img.shields.io/badge/OS-Windows%2011-blue?style=flat-square&logo=windows11)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?style=flat-square&logo=rust)
 ![IDE: VS Code](https://img.shields.io/badge/IDE-VS%20Code-007ACC?style=flat-square&logo=visualstudiocode)
