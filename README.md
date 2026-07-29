@@ -164,6 +164,6 @@ cargo run --bin client
 - **Dynamic Task Graph Updates**: Support dynamic DAG mutations and branching during runtime.
 - **Pluggable Storage Backends**: Optional SQLite/RocksDB backend for persistent task execution history and audit logs.
 
-## Specification
+## ■ Specification
 - English: docs/ninja_dag_spec_en.pdf
 - Japanese: docs/ninja_dag_spec_ja.pdf
